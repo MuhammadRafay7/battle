@@ -1,9 +1,11 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from battle.workspace import (
+    PARTIAL_FILE,
     RIVALS_DIR,
     ApplyConflict,
     add_rivals,
@@ -215,3 +217,271 @@ def test_undo_restores_the_project_exactly(tmp_path, project, baseline):
     assert (project / "app.py").read_text() == "print('hello')\n"
     assert (project / "old.py").read_text() == "gone = True\n"
     assert not (project / "src" / "new.py").exists()
+
+
+def entry_from(tmp_path, baseline, change):
+    workspace = tmp_path / "change-workspace"
+    materialize(baseline, None, workspace)
+    change(workspace)
+    entry = tmp_path / "change-entry"
+    capture(baseline, workspace, entry)
+    return entry
+
+
+def file_becomes_folder(workspace):
+    (workspace / "old.py").unlink()
+    write(workspace / "old.py" / "inner.py", "inner\n")
+
+
+def folder_becomes_file(workspace):
+    (workspace / "src" / "util.py").unlink()
+    (workspace / "src").rmdir()
+    write(workspace / "src", "now a file\n")
+
+
+def test_apply_and_undo_turn_a_file_into_a_folder(tmp_path, project, baseline):
+    entry = entry_from(tmp_path, baseline, file_becomes_folder)
+    backup = tmp_path / "backup"
+
+    apply_entry(entry, baseline, project, backup)
+    assert (project / "old.py" / "inner.py").read_text() == "inner\n"
+
+    undo_apply(backup, project)
+    assert (project / "old.py").read_text() == "gone = True\n"
+
+
+def test_apply_and_undo_turn_a_folder_into_a_file(tmp_path, project, baseline):
+    entry = entry_from(tmp_path, baseline, folder_becomes_file)
+    backup = tmp_path / "backup"
+
+    apply_entry(entry, baseline, project, backup)
+    assert (project / "src").read_text() == "now a file\n"
+
+    undo_apply(backup, project)
+    assert (project / "src" / "util.py").read_text() == "VALUE = 1\n"
+
+
+@pytest.mark.parametrize("change", [file_becomes_folder, folder_becomes_file])
+def test_materialize_handles_a_file_and_folder_swap(tmp_path, baseline, change):
+    entry = entry_from(tmp_path, baseline, change)
+    rebuilt = tmp_path / "rebuilt"
+
+    materialize(baseline, entry, rebuilt)
+
+    assert capture(baseline, rebuilt, tmp_path / "again") == {
+        "changed": json_changed(entry),
+        "deleted": json.loads((entry / "deleted.json").read_text()),
+    }
+
+
+def json_changed(entry):
+    root = entry / "files"
+    return sorted(
+        path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()
+    )
+
+
+def test_apply_refuses_to_write_through_a_symlinked_file(tmp_path, project, baseline):
+    outside = write(tmp_path / "outside.txt", "keep me")
+    (project / "app.py").unlink()
+    (project / "app.py").symlink_to(outside)
+    entry = changed_entry(tmp_path, baseline)
+
+    with pytest.raises(ValueError, match="symlink"):
+        apply_entry(entry, baseline, project, tmp_path / "backup", force=True)
+
+    assert outside.read_text() == "keep me"
+    assert not (tmp_path / "backup").exists()
+
+
+def test_apply_refuses_to_write_through_a_symlinked_folder(tmp_path, project, baseline):
+    outside = tmp_path / "outside"
+    write(outside / "util.py", "VALUE = 1\n")
+    (project / "src" / "util.py").unlink()
+    (project / "src").rmdir()
+    (project / "src").symlink_to(outside)
+    entry = changed_entry(tmp_path, baseline)
+
+    with pytest.raises(ValueError, match="symlink"):
+        apply_entry(entry, baseline, project, tmp_path / "backup", force=True)
+
+    assert not (outside / "new.py").exists()
+
+
+def test_materialize_replaces_a_link_instead_of_writing_through_it(tmp_path, baseline):
+    (baseline / "alias.py").symlink_to("app.py")
+
+    def replace_link(workspace):
+        (workspace / "alias.py").unlink()
+        write(workspace / "alias.py", "mine\n")
+
+    entry = entry_from(tmp_path, baseline, replace_link)
+    rebuilt = tmp_path / "rebuilt"
+
+    materialize(baseline, entry, rebuilt)
+
+    assert not (rebuilt / "alias.py").is_symlink()
+    assert (rebuilt / "alias.py").read_text() == "mine\n"
+    assert (rebuilt / "app.py").read_text() == "print('hello')\n"
+
+
+def test_copy_project_drops_links_to_outside_and_to_secrets(tmp_path, project):
+    outside = write(tmp_path / "private.txt", "secret")
+    write(project / ".env", "API_KEY=secret")
+    (project / "away.txt").symlink_to(outside)
+    (project / "harmless.env").symlink_to(project / ".env")
+    (project / "alias.py").symlink_to("app.py")
+    target = tmp_path / "copy"
+
+    copy_project(project, target)
+
+    assert not (target / "away.txt").is_symlink()
+    assert not (target / "harmless.env").is_symlink()
+    assert (target / "alias.py").is_symlink()
+
+
+def test_special_files_are_skipped(tmp_path, project, baseline):
+    os.mkfifo(project / "pipe")
+    target = tmp_path / "copy"
+    copy_project(project, target)
+    assert not (target / "pipe").exists()
+
+    workspace = tmp_path / "workspace"
+    materialize(baseline, None, workspace)
+    os.mkfifo(workspace / "pipe")
+    assert capture(baseline, workspace, tmp_path / "entry") == {"changed": [], "deleted": []}
+
+
+def test_a_failed_apply_puts_the_project_back(tmp_path, project, baseline):
+    def add_blocked_file(workspace):
+        write(workspace / "app.py", "print('better')\n")
+        (workspace / "old.py").unlink()
+        write(workspace / "zzz.py", "blocked\n")
+
+    entry = entry_from(tmp_path, baseline, add_blocked_file)
+    write(project / "zzz.py" / "keep.txt", "a folder in the way")
+    backup = tmp_path / "backup"
+
+    with pytest.raises(OSError):
+        apply_entry(entry, baseline, project, backup)
+
+    assert (project / "app.py").read_text() == "print('hello')\n"
+    assert (project / "old.py").read_text() == "gone = True\n"
+    assert (project / "zzz.py" / "keep.txt").exists()
+    assert not backup.exists()
+
+
+@pytest.mark.parametrize(
+    "name", [".ENV", "SERVER.PEM", "prod.env", "id_ecdsa", ".npmrc", ".netrc", ".pgpass", "app.jks"]
+)
+def test_copy_project_skips_every_kind_of_secret(tmp_path, project, name):
+    write(project / name, "secret")
+    target = tmp_path / "copy"
+
+    copy_project(project, target)
+
+    assert not (target / name).exists()
+
+
+def test_copy_project_drops_an_absolute_link_back_into_the_project(tmp_path, project):
+    (project / "pinned.py").symlink_to(project / "app.py")
+    target = tmp_path / "copy"
+
+    copy_project(project, target)
+
+    assert not os.path.lexists(target / "pinned.py")
+
+
+def test_undo_refuses_to_write_through_a_symlink(tmp_path, project, baseline):
+    entry = changed_entry(tmp_path, baseline)
+    backup = tmp_path / "backup"
+    apply_entry(entry, baseline, project, backup)
+    outside = write(tmp_path / "outside.txt", "keep me")
+    (project / "app.py").unlink()
+    (project / "app.py").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="symlink"):
+        undo_apply(backup, project)
+
+    assert outside.read_text() == "keep me"
+    assert backup.exists()
+
+
+class Killed(BaseException):
+    pass
+
+
+def test_a_kill_mid_apply_tears_no_file_and_undo_clears_up(
+    tmp_path, project, baseline, monkeypatch
+):
+    entry = changed_entry(tmp_path, baseline)
+    backup = tmp_path / "backup"
+    real_replace = os.replace
+
+    def killed_at_the_project(source, target):
+        if Path(target).parent == project:
+            raise Killed
+        real_replace(source, target)
+
+    monkeypatch.setattr(os, "replace", killed_at_the_project)
+    with pytest.raises(Killed):
+        apply_entry(entry, baseline, project, backup)
+    monkeypatch.undo()
+
+    assert (project / "app.py").read_text() == "print('hello')\n"
+    assert (project / PARTIAL_FILE).exists()
+
+    undo_apply(backup, project)
+
+    assert (project / "old.py").read_text() == "gone = True\n"
+    assert not (project / PARTIAL_FILE).exists()
+    assert not backup.exists()
+
+
+def test_undo_removes_a_new_folder_left_with_only_a_partial_file(tmp_path, project, baseline):
+    entry = entry_from(tmp_path, baseline, lambda folder: write(folder / "fresh" / "new.py", "x"))
+    backup = tmp_path / "backup"
+    apply_entry(entry, baseline, project, backup)
+    (project / "fresh" / "new.py").rename(project / "fresh" / PARTIAL_FILE)
+
+    undo_apply(backup, project)
+
+    assert not (project / "fresh").exists()
+
+
+def test_a_kill_while_deleting_the_backup_cannot_block_the_next_apply(
+    tmp_path, project, baseline
+):
+    entry = changed_entry(tmp_path, baseline)
+    backup = tmp_path / "backup"
+    retired = tmp_path / "backup.retired"
+    write(retired / "files" / "junk.py", "half deleted")
+
+    apply_entry(entry, baseline, project, backup)
+    undo_apply(backup, project)
+
+    assert not retired.exists()
+    apply_entry(entry, baseline, project, backup)
+    assert (project / "app.py").read_text() == "print('better')\n"
+
+
+@pytest.mark.skipif(os.uname().sysname == "Darwin", reason="macOS refuses names that aren't UTF-8")
+def test_a_file_name_that_is_not_utf8_cannot_stop_a_fighters_turn(tmp_path, baseline):
+    workspace = tmp_path / "workspace"
+    materialize(baseline, None, workspace)
+    (workspace / os.fsdecode(b"bad\xff.txt")).write_text("x")
+
+    capture(baseline, workspace, tmp_path / "entry")
+
+    assert "bad" in (tmp_path / "entry" / "changes.diff").read_text()
+
+
+def test_a_half_written_backup_does_not_block_the_next_apply(tmp_path, project, baseline):
+    entry = changed_entry(tmp_path, baseline)
+    write(tmp_path / "backup.partial" / "files" / "junk.py", "half")
+    backup = tmp_path / "backup"
+
+    apply_entry(entry, baseline, project, backup)
+
+    assert not (backup / "files" / "junk.py").exists()
+    assert not (tmp_path / "backup.partial").exists()

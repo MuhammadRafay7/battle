@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import contextlib
 import difflib
 import fnmatch
 import json
 import os
 import shutil
 from pathlib import Path, PurePosixPath
+from typing import Iterator
+
+from battle.store import sync_file, sync_folder, write_durable
 
 RIVALS_DIR = ".battle-rivals"
+PARTIAL_FILE = ".battle-partial"
 EXCLUDED_DIRS = frozenset(
     {
         ".git",
@@ -30,7 +35,25 @@ EXCLUDED_DIRS = frozenset(
         RIVALS_DIR,
     }
 )
-SECRET_PATTERNS = (".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa", "id_ed25519")
+SECRET_PATTERNS = (
+    ".env",
+    ".env.*",
+    "*.env",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.jks",
+    "*.keystore",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".pgpass",
+)
 SHAREABLE_ENV_FILES = frozenset({".env.example", ".env.sample", ".env.template"})
 MAX_SIMILARITY_LINES = 4000
 
@@ -41,10 +64,15 @@ class ApplyConflict(Exception):
         self.paths = paths
 
 
+class ApplyRefused(ValueError):
+    pass
+
+
 def _is_secret(name: str) -> bool:
-    if name in SHAREABLE_ENV_FILES:
+    lowered = name.lower()
+    if lowered in SHAREABLE_ENV_FILES:
         return False
-    return any(fnmatch.fnmatch(name, pattern) for pattern in SECRET_PATTERNS)
+    return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in SECRET_PATTERNS)
 
 
 def _files(root: Path) -> dict[str, Path]:
@@ -53,7 +81,7 @@ def _files(root: Path) -> dict[str, Path]:
         dirs[:] = [name for name in dirs if name not in EXCLUDED_DIRS]
         for name in names:
             path = Path(folder, name)
-            if path.is_symlink() or _is_secret(name):
+            if path.is_symlink() or not path.is_file() or _is_secret(name):
                 continue
             found[path.relative_to(root).as_posix()] = path
     return found
@@ -66,14 +94,54 @@ def _same_bytes(first: Path, second: Path) -> bool:
 
 
 def _same_file(first: Path, second: Path) -> bool:
-    if first.exists() != second.exists():
+    if first.is_file() != second.is_file():
         return False
-    return not first.exists() or _same_bytes(first, second)
+    return not first.is_file() or _same_bytes(first, second)
 
 
 def _copy(source: Path, target: Path) -> None:
+    if target.is_dir():
+        raise IsADirectoryError(f"A folder is in the way of {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
+
+
+def _install(source: Path, target: Path) -> None:
+    if target.is_dir():
+        raise IsADirectoryError(f"A folder is in the way of {target}")
+    partial = target.parent / PARTIAL_FILE
+    if os.path.lexists(partial):
+        partial.unlink()
+    _copy(source, partial)
+    sync_file(partial)
+    os.replace(partial, target)
+
+
+def _remove(root: Path, relative: str) -> None:
+    target = root / relative
+    if target.is_file():
+        target.unlink()
+    for parent in target.parents:
+        if parent == root:
+            break
+        if not parent.is_dir():
+            continue
+        if any(parent.iterdir()):
+            break
+        parent.rmdir()
+
+
+def _clear_partial(root: Path, relative: str) -> None:
+    with contextlib.suppress(FileNotFoundError, NotADirectoryError):
+        ((root / relative).parent / PARTIAL_FILE).unlink()
+
+
+def _links_on(root: Path, relative: str) -> Iterator[Path]:
+    current = root
+    for part in PurePosixPath(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            yield current
 
 
 def _require_inside(relative: str) -> None:
@@ -82,14 +150,33 @@ def _require_inside(relative: str) -> None:
         raise ValueError(f"Refusing a path outside the project: {relative}")
 
 
+def _require_safe(root: Path, relative: str) -> None:
+    _require_inside(relative)
+    if any(_links_on(root, relative)):
+        raise ApplyRefused(f"Refusing to write through a symlink: {relative}")
+
+
+def _unsafe_link(path: Path, root: Path) -> bool:
+    target = Path(os.path.realpath(path))
+    if os.path.isabs(os.readlink(path)) or not target.is_relative_to(root):
+        return True
+    return any(
+        part in EXCLUDED_DIRS or _is_secret(part) for part in target.relative_to(root).parts
+    )
+
+
 def copy_project(source: Path, target: Path) -> None:
+    root = Path(os.path.realpath(source))
+
+    def skipped(path: Path, name: str) -> bool:
+        if path.is_symlink():
+            return _is_secret(name) or _unsafe_link(path, root)
+        if path.is_dir():
+            return _is_secret(name) or name in EXCLUDED_DIRS
+        return _is_secret(name) or not path.is_file()
+
     def ignore(folder: str, names: list[str]) -> list[str]:
-        return [
-            name
-            for name in names
-            if _is_secret(name)
-            or (name in EXCLUDED_DIRS and Path(folder, name).is_dir())
-        ]
+        return [name for name in names if skipped(Path(folder, name), name)]
 
     shutil.copytree(source, target, symlinks=True, ignore=ignore)
 
@@ -132,7 +219,7 @@ def capture(baseline: Path, workspace: Path, entry: Path) -> dict[str, list[str]
         _file_diff(relative, before.get(relative), after.get(relative))
         for relative in sorted([*changed, *deleted])
     )
-    (entry / "changes.diff").write_text(diff, encoding="utf-8")
+    (entry / "changes.diff").write_text(diff, encoding="utf-8", errors="backslashreplace")
     (entry / "deleted.json").write_text(json.dumps(deleted), encoding="utf-8")
     return {"changed": changed, "deleted": deleted}
 
@@ -143,11 +230,13 @@ def materialize(baseline: Path, entry: Path | None, workspace: Path) -> None:
     copy_project(baseline, workspace)
     if entry is None:
         return
-    for relative, path in _files(entry / "files").items():
-        _copy(path, workspace / relative)
     for relative in json.loads((entry / "deleted.json").read_text(encoding="utf-8")):
         _require_inside(relative)
-        (workspace / relative).unlink(missing_ok=True)
+        _remove(workspace, relative)
+    for relative, path in _files(entry / "files").items():
+        for link in _links_on(workspace, relative):
+            link.unlink()
+        _copy(path, workspace / relative)
 
 
 def add_rivals(workspace: Path, rivals: dict[str, Path]) -> None:
@@ -175,6 +264,20 @@ def similarity(first: Path, second: Path) -> float:
     return difflib.SequenceMatcher(None, first_lines, second_lines, autojunk=False).ratio()
 
 
+def _partial_backup(backup: Path) -> Path:
+    return backup.with_name(backup.name + ".partial")
+
+
+def _retired_backup(backup: Path) -> Path:
+    return backup.with_name(backup.name + ".retired")
+
+
+def _clear_backup_leftovers(backup: Path) -> None:
+    for leftover in (_partial_backup(backup), _retired_backup(backup)):
+        if leftover.exists():
+            shutil.rmtree(leftover)
+
+
 def apply_entry(
     entry: Path, baseline: Path, project: Path, backup: Path, force: bool = False
 ) -> dict[str, list[str]]:
@@ -182,7 +285,7 @@ def apply_entry(
     changed = sorted(incoming)
     deleted = json.loads((entry / "deleted.json").read_text(encoding="utf-8"))
     for relative in [*changed, *deleted]:
-        _require_inside(relative)
+        _require_safe(project, relative)
     if backup.exists():
         raise ValueError("This champion has already been applied.")
 
@@ -202,30 +305,40 @@ def apply_entry(
         if conflicts:
             raise ApplyConflict(sorted(conflicts))
 
-    created = [relative for relative in changed if not (project / relative).exists()]
-    (backup / "files").mkdir(parents=True)
+    created = [relative for relative in changed if not (project / relative).is_file()]
+    _clear_backup_leftovers(backup)
+    partial = _partial_backup(backup)
+    (partial / "files").mkdir(parents=True)
     for relative in [*changed, *deleted]:
-        if (project / relative).exists():
-            _copy(project / relative, backup / "files" / relative)
-    (backup / "manifest.json").write_text(json.dumps({"created": created}), encoding="utf-8")
+        if (project / relative).is_file():
+            _install(project / relative, partial / "files" / relative)
+    write_durable(partial / "manifest.json", json.dumps({"created": created}))
+    partial.rename(backup)
+    sync_folder(backup.parent)
 
-    for relative in changed:
-        _copy(incoming[relative], project / relative)
-    for relative in deleted:
-        (project / relative).unlink(missing_ok=True)
+    try:
+        for relative in deleted:
+            _remove(project, relative)
+        for relative in changed:
+            _install(incoming[relative], project / relative)
+    except OSError:
+        undo_apply(backup, project)
+        raise
     return {"changed": changed, "deleted": deleted}
 
 
 def undo_apply(backup: Path, project: Path) -> None:
     manifest = json.loads((backup / "manifest.json").read_text(encoding="utf-8"))
+    restored = _files(backup / "files")
+    for relative in [*manifest["created"], *restored]:
+        _require_safe(project, relative)
+    for relative in [*manifest["created"], *restored]:
+        _clear_partial(project, relative)
     for relative in manifest["created"]:
-        _require_inside(relative)
-        target = project / relative
-        target.unlink(missing_ok=True)
-        for parent in target.parents:
-            if parent == project or any(parent.iterdir()):
-                break
-            parent.rmdir()
-    for relative, path in _files(backup / "files").items():
-        _copy(path, project / relative)
-    shutil.rmtree(backup)
+        _remove(project, relative)
+    for relative, path in restored.items():
+        _install(path, project / relative)
+    _clear_backup_leftovers(backup)
+    backup.rename(_retired_backup(backup))
+    sync_folder(backup.parent)
+    shutil.rmtree(_retired_backup(backup))

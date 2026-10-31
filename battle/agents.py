@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
-from dataclasses import dataclass
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Protocol
+from typing import Any, BinaryIO, Mapping, Protocol
+
+from battle import tether
+from battle.tether import EXIT_CANNOT_START, MARK_VARIABLE, START_FAILED, kill_marked
 
 DEFAULT_TIMEOUT = 1800.0
+TETHER = str(Path(tether.__file__).resolve())
+POLL_SECONDS = 0.2
+REAP_SECONDS = 2.0
 SHORT_MESSAGE_CHARS = 300
 FAILURE_LIMIT_PATTERN = re.compile(
     r"usage limit|limit reached|rate.?limit|quota|hit your .{0,30}limit|too many requests|\b429\b",
@@ -48,6 +59,10 @@ class UsageLimitReached(AgentError):
     pass
 
 
+class AgentStopped(AgentError):
+    pass
+
+
 @dataclass(frozen=True)
 class Job:
     role: str
@@ -75,6 +90,8 @@ def extract_json(text: str) -> dict:
         except ValueError:
             position += 1
             continue
+        except RecursionError as error:
+            raise ValueError("The reply's JSON is nested too deeply.") from error
         if isinstance(value, dict):
             found = value
     if found is None:
@@ -86,33 +103,121 @@ def child_env(environment: Mapping[str, str]) -> dict[str, str]:
     return {key: value for key, value in environment.items() if key not in SESSION_VARIABLES}
 
 
-def _execute(
-    argv: list[str], job: Job, extra_env: Mapping[str, str] | None = None
-) -> tuple[int, str, str]:
+def _kill_group(process: subprocess.Popen) -> None:
     try:
-        process = subprocess.Popen(
-            argv,
-            cwd=job.cwd,
-            env=child_env(os.environ) | dict(extra_env or {}),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            start_new_session=True,
-        )
-    except FileNotFoundError as error:
-        raise AgentError(f"{argv[0]} is not installed or not on PATH.") from error
-    try:
-        stdout, stderr = process.communicate(job.prompt, timeout=job.timeout)
-    except BaseException as error:
         os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
-        if isinstance(error, subprocess.TimeoutExpired):
-            raise AgentError(f"{argv[0]} timed out after {job.timeout:g} seconds.") from error
-        raise
-    return process.returncode, stdout, stderr
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+class ProcessGroups:
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._live: dict[subprocess.Popen, int] = {}
+        self.cancelled = threading.Event()
+
+    def start(self, argv: list[str], mark: str, **options: Any) -> subprocess.Popen:
+        with self._guard:
+            if self.cancelled.is_set():
+                raise AgentStopped(f"{argv[0]} was not started because Battle is stopping.")
+            read_end, write_end = os.pipe()
+            try:
+                process = subprocess.Popen(
+                    [sys.executable, "-I", "-S", TETHER, str(read_end), mark, *argv],
+                    start_new_session=True,
+                    pass_fds=(read_end,),
+                    **options,
+                )
+            except BaseException:
+                os.close(write_end)
+                raise
+            finally:
+                os.close(read_end)
+            self._live[process] = write_end
+            return process
+
+    def finish(self, process: subprocess.Popen, mark: str) -> None:
+        with self._guard:
+            write_end = self._live.pop(process)
+            _kill_group(process)
+            os.close(write_end)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=REAP_SECONDS)
+        kill_marked(mark)
+
+    def cancel(self) -> None:
+        with self._guard:
+            self.cancelled.set()
+            for process in self._live:
+                _kill_group(process)
+
+
+@dataclass(frozen=True)
+class _ProcessAgent:
+    groups: ProcessGroups = field(
+        default_factory=ProcessGroups, repr=False, compare=False, kw_only=True
+    )
+
+    def cancel(self) -> None:
+        self.groups.cancel()
+
+
+def _await_exit(process: subprocess.Popen, name: str, job: Job, groups: ProcessGroups) -> None:
+    deadline = time.monotonic() + job.timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        try:
+            process.wait(timeout=max(0, min(POLL_SECONDS, remaining)))
+        except subprocess.TimeoutExpired as error:
+            if groups.cancelled.is_set():
+                raise AgentStopped(f"{name} was stopped.") from error
+            if time.monotonic() >= deadline:
+                raise AgentError(f"{name} timed out after {job.timeout:g} seconds.") from error
+            continue
+        if groups.cancelled.is_set() and process.returncode != 0:
+            raise AgentStopped(f"{name} was stopped.")
+        return
+
+
+def _decoded(output: BinaryIO) -> str:
+    output.seek(0)
+    return output.read().decode("utf-8", "replace")
+
+
+def _execute(
+    argv: list[str],
+    job: Job,
+    groups: ProcessGroups,
+    extra_env: Mapping[str, str] | None = None,
+) -> tuple[int, str, str]:
+    mark = uuid.uuid4().hex
+    with (
+        tempfile.TemporaryFile() as prompt,
+        tempfile.TemporaryFile() as stdout,
+        tempfile.TemporaryFile() as stderr,
+    ):
+        prompt.write(job.prompt.encode("utf-8", "replace"))
+        prompt.seek(0)
+        try:
+            process = groups.start(
+                argv,
+                mark,
+                cwd=job.cwd,
+                env=child_env(os.environ) | dict(extra_env or {}) | {MARK_VARIABLE: mark},
+                stdin=prompt,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        except OSError as error:
+            raise AgentError(f"{argv[0]} could not start: {error}") from error
+        try:
+            _await_exit(process, argv[0], job, groups)
+        finally:
+            groups.finish(process, mark)
+        output, errors = _decoded(stdout), _decoded(stderr)
+    if process.returncode == EXIT_CANNOT_START and errors.startswith(START_FAILED):
+        raise AgentError(f"{argv[0]} {errors.removeprefix(START_FAILED)}")
+    return process.returncode, output, errors
 
 
 def _check(name: str, failed: bool, message: str) -> None:
@@ -126,7 +231,7 @@ def _check(name: str, failed: bool, message: str) -> None:
 
 
 @dataclass(frozen=True)
-class ClaudeAgent:
+class ClaudeAgent(_ProcessAgent):
     model: str | None = None
     allow_bash: bool = False
     web: bool = True
@@ -144,6 +249,8 @@ class ClaudeAgent:
             "json",
             "--no-session-persistence",
             "--strict-mcp-config",
+            "--setting-sources",
+            "user",
             "--permission-mode",
             "acceptEdits" if job.writes else "dontAsk",
             "--tools",
@@ -158,7 +265,7 @@ class ClaudeAgent:
         return argv
 
     def run(self, job: Job) -> str:
-        code, stdout, stderr = _execute(self.command(job), job)
+        code, stdout, stderr = _execute(self.command(job), job, self.groups)
         try:
             payload = json.loads(stdout)
         except ValueError:
@@ -173,7 +280,7 @@ class ClaudeAgent:
 
 
 @dataclass(frozen=True)
-class CodexAgent:
+class CodexAgent(_ProcessAgent):
     model: str | None = None
     web: bool = True
     binary: str = "codex"
@@ -201,14 +308,18 @@ class CodexAgent:
     def run(self, job: Job) -> str:
         with tempfile.TemporaryDirectory(prefix="battle-codex-") as folder:
             reply_file = Path(folder) / "reply.txt"
-            code, stdout, stderr = _execute(self.command(job, reply_file), job)
-            text = reply_file.read_text(encoding="utf-8") if reply_file.exists() else ""
+            code, stdout, stderr = _execute(self.command(job, reply_file), job, self.groups)
+            text = (
+                reply_file.read_text(encoding="utf-8", errors="replace")
+                if reply_file.exists()
+                else ""
+            )
         _check(self.name, code != 0, text if code == 0 else stderr or stdout or text)
         return text
 
 
 @dataclass(frozen=True)
-class CommandAgent:
+class CommandAgent(_ProcessAgent):
     command_line: str
     web: bool = True
     name: str = "command"
@@ -217,6 +328,7 @@ class CommandAgent:
         code, stdout, stderr = _execute(
             shlex.split(self.command_line),
             job,
+            self.groups,
             {"BATTLE_ROLE": job.role, "BATTLE_WEB": "1" if self.web else "0"},
         )
         _check(self.name, code != 0, stdout if code == 0 else stderr or stdout)
@@ -231,5 +343,8 @@ def make_agent(
     if spec == "codex":
         return CodexAgent(model=model, web=web)
     if spec.startswith("command:"):
-        return CommandAgent(spec.removeprefix("command:"), web=web)
+        command_line = spec.removeprefix("command:")
+        if not shlex.split(command_line):
+            raise ValueError("Give a command after command:.")
+        return CommandAgent(command_line, web=web)
     raise ValueError(f"Unknown agent: {spec}. Use claude, codex or command:<your command>.")

@@ -35,7 +35,7 @@ Never do the task yourself. Battle's agents do the work, and your only job is to
    ```
 
 6. With `--agent host`, run the loop below. Otherwise skip it, and use Monitor on `tail -f <log path>` to show each fighter starting and finishing.
-7. When the status is no longer `prepared` or `running`, handle it:
+7. When the status is no longer `prepared` or `running`, stop every agent still running from this battle, because they keep using the plan's allowance. Then handle the status:
    - **done:** read the `report` path. Tell the user the champion, why it won and which files changed, plus `battle undo <run id>`.
    - **paused:** the plan's usage limit was reached and finished work is saved. Tell the user to run `battle resume <run id>` after it resets. Do not resume it yourself.
    - **failed or stopped:** say what stopped it. The background command's output has the reason.

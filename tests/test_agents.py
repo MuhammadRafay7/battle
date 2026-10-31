@@ -1,10 +1,15 @@
 import stat
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from battle.agents import (
     AgentError,
+    AgentStopped,
     ClaudeAgent,
     CodexAgent,
     CommandAgent,
@@ -13,6 +18,17 @@ from battle.agents import (
     child_env,
     extract_json,
     make_agent,
+)
+
+ROOT = Path(__file__).resolve().parent.parent
+ENGINE = """
+import sys
+from pathlib import Path
+from battle.agents import CommandAgent, Job
+CommandAgent(sys.argv[1]).run(Job("fighter", "go", Path(sys.argv[2]), True))
+"""
+needs_proc = pytest.mark.skipif(
+    not Path("/proc/self/environ").exists(), reason="needs /proc to find marked processes"
 )
 
 
@@ -100,6 +116,12 @@ def test_claude_agents_never_load_your_mcp_servers(tmp_path, writes):
     argv = ClaudeAgent().command(job(tmp_path, writes=writes))
     assert "--strict-mcp-config" in argv
     assert "--mcp-config" not in argv
+
+
+@pytest.mark.parametrize("writes", [True, False])
+def test_claude_agents_never_run_hooks_from_a_copy_of_the_project(tmp_path, writes):
+    argv = ClaudeAgent().command(job(tmp_path, writes=writes))
+    assert argv[argv.index("--setting-sources") + 1] == "user"
 
 
 def test_claude_passes_the_chosen_model(tmp_path):
@@ -256,3 +278,252 @@ def test_prompt_is_sent_on_stdin_so_long_tasks_fit(tmp_path):
     long_prompt = "x" * 300_000
     agent = CommandAgent(script(tmp_path / "tool", "wc -c\n"))
     assert agent.run(job(tmp_path, prompt=long_prompt)).strip() == "300000"
+
+
+def test_a_slow_reader_still_gets_the_whole_prompt(tmp_path):
+    agent = CommandAgent(script(tmp_path / "tool", "sleep 0.5\nwc -c\n"))
+    assert agent.run(job(tmp_path, prompt="x" * 300_000)).strip() == "300000"
+
+
+def wait_for(path: Path) -> None:
+    deadline = time.monotonic() + 10
+    while not path.exists():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+
+def stopped_growing(path: Path) -> bool:
+    time.sleep(0.2)
+    size = path.stat().st_size
+    time.sleep(0.4)
+    return path.stat().st_size == size
+
+
+def test_cancel_kills_the_whole_group_and_counts_as_a_stop(tmp_path):
+    beat = tmp_path / "beat"
+    agent = CommandAgent(
+        script(
+            tmp_path / "tool",
+            f"""cat > /dev/null
+(while true; do date >> {beat}; sleep 0.05; done) &
+wait
+""",
+        )
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        running = pool.submit(agent.run, job(tmp_path))
+        wait_for(beat)
+        agent.cancel()
+        with pytest.raises(AgentStopped):
+            running.result(timeout=10)
+
+    assert stopped_growing(beat)
+
+
+def test_a_cancelled_agent_starts_nothing_new(tmp_path):
+    mark = tmp_path / "mark"
+    agent = CommandAgent(script(tmp_path / "tool", f"touch {mark}\n"))
+    agent.cancel()
+
+    with pytest.raises(AgentStopped):
+        agent.run(job(tmp_path))
+
+    assert not mark.exists()
+
+
+def test_one_agents_cancel_leaves_another_alone(tmp_path):
+    tool = script(tmp_path / "tool", "cat > /dev/null\nprintf ok\n")
+    CommandAgent(tool).cancel()
+    assert CommandAgent(tool).run(job(tmp_path)) == "ok"
+
+
+def test_an_escaped_process_holding_the_pipes_cannot_hang_a_timeout(tmp_path):
+    escape = "import os, time; os.setsid(); time.sleep(5)"
+    agent = CommandAgent(
+        script(
+            tmp_path / "tool",
+            f"""cat > /dev/null
+{sys.executable} -c '{escape}' &
+sleep 30
+""",
+        )
+    )
+    started = time.monotonic()
+
+    with pytest.raises(AgentError, match="timed out"):
+        agent.run(job(tmp_path, timeout=0.3))
+
+    assert time.monotonic() - started < 4
+
+
+def test_background_processes_die_with_their_agent(tmp_path):
+    beat = tmp_path / "beat"
+    agent = CommandAgent(
+        script(
+            tmp_path / "tool",
+            f"""cat > /dev/null
+(while true; do date >> {beat}; sleep 0.05; done) > /dev/null 2>&1 &
+sleep 0.2
+printf ok
+""",
+        )
+    )
+
+    assert agent.run(job(tmp_path)) == "ok"
+    assert stopped_growing(beat)
+
+
+def test_a_background_process_holding_stdout_cannot_hang_a_finished_agent(tmp_path):
+    agent = CommandAgent(script(tmp_path / "tool", "cat > /dev/null\nsleep 30 &\nprintf ok\n"))
+    started = time.monotonic()
+
+    assert agent.run(job(tmp_path, timeout=20)) == "ok"
+
+    assert time.monotonic() - started < 10
+
+
+def test_an_escaped_process_cannot_cost_a_finished_agent_its_reply(tmp_path):
+    escape = "import os, time; os.setsid(); time.sleep(5)"
+    agent = CommandAgent(
+        script(
+            tmp_path / "tool",
+            f"""cat > /dev/null
+{sys.executable} -c '{escape}' &
+printf ok
+""",
+        )
+    )
+    started = time.monotonic()
+
+    assert agent.run(job(tmp_path, timeout=3)) == "ok"
+
+    assert time.monotonic() - started < 3
+
+
+def escaping_beat(tmp_path: Path, beat: Path) -> Path:
+    runner = tmp_path / "escape.py"
+    runner.write_text(
+        "import os, time\n"
+        "os.setsid()\n"
+        "while True:\n"
+        f"    open({str(beat)!r}, 'a').write('x')\n"
+        "    time.sleep(0.05)\n"
+    )
+    return runner
+
+
+@needs_proc
+def test_a_process_that_leaves_the_group_dies_with_its_agent(tmp_path):
+    beat = tmp_path / "beat"
+    runner = escaping_beat(tmp_path, beat)
+    agent = CommandAgent(
+        script(
+            tmp_path / "tool",
+            f"""cat > /dev/null
+{sys.executable} {runner} &
+while [ ! -e {beat} ]; do sleep 0.01; done
+printf ok
+""",
+        )
+    )
+
+    assert agent.run(job(tmp_path, timeout=10)) == "ok"
+
+    assert stopped_growing(beat)
+
+
+def start_engine(tool: str, tmp_path: Path) -> subprocess.Popen:
+    return subprocess.Popen([sys.executable, "-c", ENGINE, tool, str(tmp_path)], cwd=ROOT)
+
+
+def test_agents_die_when_battle_is_killed_without_warning(tmp_path):
+    beat = tmp_path / "beat"
+    tool = script(
+        tmp_path / "tool",
+        f"""cat > /dev/null
+while true; do date >> {beat}; sleep 0.05; done
+""",
+    )
+    engine = start_engine(tool, tmp_path)
+    wait_for(beat)
+
+    engine.kill()
+    engine.wait()
+
+    assert stopped_growing(beat)
+
+
+@needs_proc
+def test_a_process_that_left_the_group_dies_when_battle_is_killed(tmp_path):
+    beat = tmp_path / "beat"
+    runner = escaping_beat(tmp_path, beat)
+    tool = script(tmp_path / "tool", f"cat > /dev/null\n{sys.executable} {runner} &\nsleep 30\n")
+    engine = start_engine(tool, tmp_path)
+    wait_for(beat)
+
+    engine.kill()
+    engine.wait()
+
+    assert stopped_growing(beat)
+
+
+def test_an_agent_gets_normal_signal_handling_through_the_tether(tmp_path):
+    errors = tmp_path / "errors"
+    agent = CommandAgent(
+        script(
+            tmp_path / "tool",
+            f"""cat > /dev/null
+yes 2> {errors} | head -n 1 > /dev/null
+printf ok
+""",
+        )
+    )
+
+    assert agent.run(job(tmp_path)) == "ok"
+
+    assert errors.read_text() == ""
+
+
+def test_a_folder_that_vanished_is_not_called_a_missing_program(tmp_path):
+    with pytest.raises(AgentError, match="could not start"):
+        CommandAgent("true").run(job(tmp_path / "gone"))
+
+
+def test_a_binary_that_cannot_run_is_an_agent_error(tmp_path):
+    tool = tmp_path / "tool"
+    tool.write_text("not runnable")
+    with pytest.raises(AgentError, match="could not start"):
+        CommandAgent(str(tool)).run(job(tmp_path))
+
+
+def test_a_program_that_is_not_an_executable_format_is_an_agent_error(tmp_path):
+    tool = tmp_path / "tool"
+    tool.write_bytes(b"\x00\x01\x02")
+    tool.chmod(0o755)
+    with pytest.raises(AgentError, match="could not start"):
+        CommandAgent(str(tool)).run(job(tmp_path))
+
+
+def test_extract_json_treats_absurd_nesting_as_a_bad_reply():
+    with pytest.raises(ValueError, match="nested"):
+        extract_json('{"a":' * 100_000)
+
+
+def test_a_codex_reply_that_is_not_valid_text_is_still_read(tmp_path):
+    binary = script(
+        tmp_path / "codex",
+        """cat > /dev/null
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then printf 'ok \\377' > "$2"; fi
+  shift
+done
+""",
+    )
+    assert CodexAgent(binary=binary).run(job(tmp_path)).startswith("ok")
+
+
+@pytest.mark.parametrize("spec", ["command:", "command:   ", "command:tool 'open"])
+def test_make_agent_rejects_a_command_that_cannot_run(spec):
+    with pytest.raises(ValueError):
+        make_agent(spec)

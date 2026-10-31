@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from battle.agents import AgentError, Job, UsageLimitReached
+from battle.agents import AgentError, AgentStopped, Job, UsageLimitReached
 from battle.fight import Fight
 from battle.host import (
     HostAgent,
@@ -233,6 +233,23 @@ def test_cancel_stops_a_waiting_job(tmp_path):
     threading.Timer(0.05, agent.cancel).start()
     with pytest.raises(AgentError, match="stopped"):
         agent.run(job(tmp_path, timeout=30))
+
+
+def test_a_cancelled_job_counts_as_a_stop_not_a_failure(tmp_path):
+    agent = HostAgent(tmp_path, poll_seconds=0.01)
+    agent.cancel()
+    with pytest.raises(AgentStopped):
+        agent.run(job(tmp_path, timeout=30))
+
+
+def test_a_late_reply_cannot_answer_a_job_from_a_newer_engine(tmp_path):
+    _ignore(HostAgent(tmp_path, poll_seconds=0.01), job(tmp_path, timeout=0.02))
+    stale = next(tmp_path.glob("*.json")).stem
+    reset_jobs(tmp_path)
+    _ignore(HostAgent(tmp_path, poll_seconds=0.01), job(tmp_path, timeout=0.02))
+
+    with pytest.raises(ValueError, match=stale):
+        post_reply(tmp_path, stale, "late")
 
 
 @pytest.mark.parametrize("post", [post_reply, post_failure, post_usage_limit])

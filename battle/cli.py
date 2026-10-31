@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
-import functools
 import json
 import os
 import shutil
+import signal
 import sys
+import threading
 import time
+import traceback
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
-from battle.agents import DEFAULT_TIMEOUT, Agent, AgentError, UsageLimitReached, make_agent
-from battle.fight import BattleError, Fight, apply_champion, undo_champion
+from battle.agents import DEFAULT_TIMEOUT, Agent, UsageLimitReached, make_agent
+from battle.fight import Fight, apply_champion, roll_back_cut_off_apply, undo_champion
 from battle.host import (
     HostAgent,
     claim_jobs,
@@ -26,7 +29,9 @@ from battle.store import AlreadyRunning, RunNotFound, RunStore, latest_run
 
 EXIT_ERROR = 1
 EXIT_PAUSED = 75
-EXIT_INTERRUPTED = 130
+EXIT_SIGNAL_BASE = 128
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+WATCH_DONE = 0
 INSTALLED_AGENTS = ("claude", "codex")
 HOST_AGENT = "host"
 HOST_LIMIT = 20
@@ -37,6 +42,44 @@ WAITING_STATUSES = ("prepared", "running")
 def _fail(message: str) -> int:
     print(f"battle: {message}", file=sys.stderr)
     return EXIT_ERROR
+
+
+def _print_line(message: str) -> None:
+    with contextlib.suppress(OSError):
+        print(message, flush=True)
+
+
+@contextlib.contextmanager
+def _stop_on_signals(stop: Callable[[int], None]) -> Iterator[None]:
+    read_end, write_end = os.pipe()
+
+    def notice(signum: int, _frame: Any) -> None:
+        os.write(write_end, bytes([signum]))
+
+    def watch() -> None:
+        while (signum := os.read(read_end, 1)[0]) != WATCH_DONE:
+            stop(signum)
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    earlier = {
+        number: signal.signal(number, notice)
+        for number in STOP_SIGNALS
+        if signal.getsignal(number) != signal.SIG_IGN
+    }
+    try:
+        yield
+    finally:
+        for number, handler in earlier.items():
+            signal.signal(number, handler)
+        os.write(write_end, bytes([WATCH_DONE]))
+        watcher.join()
+        os.close(read_end)
+        os.close(write_end)
+
+
+def _finish_first(_signum: int) -> None:
+    pass
 
 
 def _bracket(args: argparse.Namespace) -> Bracket:
@@ -51,6 +94,11 @@ def _bracket(args: argparse.Namespace) -> Bracket:
 def _require_valid_at_once(args: argparse.Namespace) -> None:
     if args.at_once is not None and args.at_once < 1:
         raise ValueError("--at-once must be at least 1.")
+
+
+def _require_valid_timeout(args: argparse.Namespace) -> None:
+    if not args.timeout > 0:
+        raise ValueError("--timeout must be more than 0.")
 
 
 def _describe(bracket: Bracket, requested: int | None) -> None:
@@ -113,6 +161,8 @@ def _show_result(store: RunStore, result: dict[str, Any]) -> None:
         print("Not applied. These files changed during the battle:")
         print("\n".join(f"  {path}" for path in result["conflicts"]))
         print(f"Apply anyway with: battle apply {store.id} --force")
+    elif result.get("refused"):
+        print(f"Not applied: {result['refused']}")
     else:
         print(f"Not applied. Apply with: battle apply {store.id}")
     print(f"Report: {store.root / 'report.md'}")
@@ -124,39 +174,59 @@ def _limit(settings: dict[str, Any]) -> int:
     return min(limit, HOST_LIMIT) if HOST_AGENT in settings["agents"] else limit
 
 
+def _record_end(store: RunStore, error: Exception, stop_signal: int | None) -> int:
+    if stop_signal is not None:
+        store.set_status("stopped")
+        _print_line(f"Stopped. Continue with: battle resume {store.id}")
+        return EXIT_SIGNAL_BASE + stop_signal
+    if isinstance(error, UsageLimitReached):
+        store.set_status("paused")
+        _print_line(f"Paused: {error}")
+        _print_line("All finished work is saved.")
+        _print_line(f"After the limit resets, run: battle resume {store.id}")
+        return EXIT_PAUSED
+    store.set_status("failed")
+    store.note("".join(traceback.format_exception(error)))
+    _print_line(f"Failed: {str(error) or type(error).__name__}")
+    _print_line(f"Finished work is saved. Retry with: battle resume {store.id}")
+    return EXIT_ERROR
+
+
+def _live_status(store: RunStore) -> str:
+    if store.status != "running" or store.engine_running():
+        return store.status
+    latest = RunStore.open(store.id).status
+    return "stopped" if latest == "running" else latest
+
+
 def _start(store: RunStore) -> int:
-    settings = store.settings
-    agents = _build_agents(
-        settings["agents"],
-        settings.get("model"),
-        settings["allow_bash"],
-        settings.get("web", False),
-        store.root / "jobs",
-    )
-    limit = _limit(settings)
-    log = functools.partial(print, flush=True)
     with store.lock():
-        store.set_status("running")
-        reset_jobs(store.root / "jobs")
-        try:
-            result = Fight(store, agents, limit, log).run()
-        except UsageLimitReached as error:
-            store.set_status("paused")
-            print(f"Paused: {error}")
-            print("All finished work is saved.")
-            print(f"After the limit resets, run: battle resume {store.id}")
-            return EXIT_PAUSED
-        except (BattleError, AgentError) as error:
-            store.set_status("failed")
-            print(f"Stopped: {error}")
-            print(f"Finished work is saved. Retry with: battle resume {store.id}")
-            return EXIT_ERROR
-        except KeyboardInterrupt:
-            store.set_status("paused")
-            print(f"Stopped. Continue with: battle resume {store.id}")
-            return EXIT_INTERRUPTED
+        if store.status == "done":
+            with _stop_on_signals(_finish_first):
+                rolled_back = roll_back_cut_off_apply(store)
+            print(f"Battle {store.id} already finished.")
+            if rolled_back:
+                print("An apply was cut off, so the project was put back.")
+                print(f"Apply with: battle apply {store.id}")
+            return 0
+        settings = store.settings
+        agents = _build_agents(
+            settings["agents"],
+            settings.get("model"),
+            settings["allow_bash"],
+            settings.get("web", False),
+            store.root / "jobs",
+        )
+        fight = Fight(store, agents, _limit(settings), _print_line)
+        with _stop_on_signals(fight.stop):
+            try:
+                reset_jobs(store.root / "jobs")
+                store.set_status("running")
+                result = fight.run()
+            except Exception as error:
+                return _record_end(store, error, fight.stop_signal)
     _show_result(store, result)
-    return 0 if result["applied"] or not result.get("conflicts") else EXIT_ERROR
+    return EXIT_ERROR if result.get("conflicts") or result.get("refused") else 0
 
 
 def _plan(args: argparse.Namespace) -> int:
@@ -180,7 +250,8 @@ def _exclude_from_git(project: Path) -> None:
         return
     text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
     if ".battle/" not in text.splitlines():
-        exclude.write_text(text + ".battle/\n", encoding="utf-8")
+        separator = "\n" if text and not text.endswith("\n") else ""
+        exclude.write_text(f"{text}{separator}.battle/\n", encoding="utf-8")
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -190,6 +261,7 @@ def _run(args: argparse.Namespace) -> int:
         raise ValueError(f"{project} is not a folder.")
     bracket = _bracket(args)
     _require_valid_at_once(args)
+    _require_valid_timeout(args)
     specs = args.agent or ["claude"]
     host = HOST_AGENT in specs
     if host:
@@ -220,18 +292,14 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def _resume(args: argparse.Namespace) -> int:
-    store = _open(args)
-    if store.status == "done":
-        print(f"Battle {store.id} already finished.")
-        return 0
-    return _start(store)
+    return _start(_open(args))
 
 
 def _status(args: argparse.Namespace) -> int:
     store = _open(args)
     bracket = Bracket(*(store.settings[key] for key in ("groups", "fighters", "rounds", "final_rounds")))
     print(f"Battle: {store.id}")
-    print(f"Status: {store.status}")
+    print(f"Status: {_live_status(store)}")
     print(f"Task: {store.task}")
     print(f"Project: {store.project}")
     print(f"Progress: {len(store.steps)} of about {bracket.estimated_runs()} steps")
@@ -244,19 +312,24 @@ def _apply(args: argparse.Namespace) -> int:
     store = _open(args)
     if not (store.root / "champion").exists():
         raise ValueError("This battle has no champion yet.")
-    outcome = apply_champion(store, force=args.force)
+    with store.lock(), _stop_on_signals(_finish_first):
+        outcome = apply_champion(store, force=args.force)
     if outcome["applied"]:
         print(f"Applied: {len(outcome['changed'])} changed, {len(outcome['deleted'])} deleted")
         return 0
+    if outcome.get("refused"):
+        return _fail(outcome["refused"])
     files = ", ".join(outcome["conflicts"])
     return _fail(f"These files changed during the battle: {files}. Use --force to overwrite them.")
 
 
 def _undo(args: argparse.Namespace) -> int:
     store = _open(args)
-    if not (store.root / "backup").exists():
-        raise ValueError("This battle's champion is not applied.")
-    undo_champion(store)
+    with store.lock(), _stop_on_signals(_finish_first):
+        recorded = store.steps.get("result", {}).get("applied")
+        if not recorded and not (store.root / "backup").exists():
+            raise ValueError("This battle's champion is not applied.")
+        undo_champion(store)
     print("Project restored.")
     return 0
 
@@ -267,11 +340,10 @@ def _jobs(args: argparse.Namespace) -> int:
     while True:
         store = RunStore.open(run_id)
         jobs_dir = store.root / "jobs"
-        jobs = claim_jobs(jobs_dir) if jobs_dir.exists() else []
-        status = store.status
-        if status == "running" and not store.engine_running():
-            status = "stopped"
-        if jobs or status not in WAITING_STATUSES or time.monotonic() >= deadline:
+        status = _live_status(store)
+        waiting = status in WAITING_STATUSES
+        jobs = claim_jobs(jobs_dir) if waiting and jobs_dir.exists() else []
+        if jobs or not waiting or time.monotonic() >= deadline:
             break
         time.sleep(0.5)
     payload: dict[str, Any] = {"run": run_id, "status": status, "jobs": jobs}
@@ -351,7 +423,7 @@ def _parser() -> argparse.ArgumentParser:
     run.set_defaults(handler=_run)
 
     for name, handler, description in (
-        ("resume", _resume, "continue a paused or failed battle"),
+        ("resume", _resume, "continue a paused, stopped or failed battle"),
         ("status", _status, "show a battle's progress"),
         ("undo", _undo, "restore the project from before the champion was applied"),
     ):
@@ -385,5 +457,5 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         return args.handler(args)
-    except (ValueError, RunNotFound, AlreadyRunning) as error:
+    except (ValueError, OSError, RunNotFound, AlreadyRunning) as error:
         return _fail(str(error))

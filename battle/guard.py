@@ -4,46 +4,83 @@ import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Sequence
 
 ROLES = ("fighter", "judge")
 FILE_TOOLS = ("Read", "Edit", "Write")
 EXIT_BLOCKED = 2
-RUN_FOLDER = re.compile(r"^.*/\.battle/runs/[^/]+(?:/|$)")
-PROMPT_FILE = re.compile(r"^.*/\.battle/runs/[^/]+/jobs/\d+\.prompt\.md$")
-WORKSPACE = re.compile(r"^(?P<run>.*/\.battle/runs/[^/]+)/workspace/(?P<fighter>[^/]+)(?:/|$)")
+BEFORE_FIRST_RUN = r"(?:(?!/\.battle/runs/).)*"
+RUN_FOLDER = re.compile(rf"^(?P<run>(?P<home>{BEFORE_FIRST_RUN})/\.battle/runs/[^/]+)(?:/|$)")
+ROOTED_PATTERN = re.compile(r"(?:^|[{,])\s*[/~]")
+PROMPT_FILE = re.compile(rf"^{BEFORE_FIRST_RUN}/\.battle/runs/[^/]+/jobs/\d+\.prompt\.md$")
+WORKSPACE = re.compile(
+    rf"^(?P<run>{BEFORE_FIRST_RUN}/\.battle/runs/[^/]+)/workspace/(?P<fighter>[^/]+)(?:/|$)"
+)
 
 
 def _claim(claims: Path, agent: str, fighter: str) -> str:
     claims.mkdir(exist_ok=True)
     path = claims / re.sub(r"[^\w-]", "_", agent)
+    handle, partial = tempfile.mkstemp(dir=claims)
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        stream.write(fighter)
     try:
-        with path.open("x", encoding="utf-8") as handle:
-            handle.write(fighter)
+        os.link(partial, path)
     except FileExistsError:
         return path.read_text(encoding="utf-8")
+    finally:
+        os.unlink(partial)
     return fighter
 
 
 def _escapes(pattern: str | None) -> bool:
-    return bool(pattern) and (pattern.startswith(("/", "~")) or ".." in pattern)
+    return bool(pattern) and (ROOTED_PATTERN.search(pattern) is not None or ".." in pattern)
+
+
+def _owns_run(run: str, home: str, cwd: str) -> bool:
+    state = Path(run, "state.json")
+    if state.exists():
+        project = Path(os.path.realpath(json.loads(state.read_text(encoding="utf-8"))["project"]))
+        return Path(cwd).is_relative_to(project) or project.is_relative_to(cwd)
+    configured = os.environ.get("BATTLE_HOME")
+    if configured and os.path.realpath(os.path.expanduser(configured)) == f"{home}/.battle":
+        return True
+    return Path(cwd).is_relative_to(home)
+
+
+def _check_prompt(prompt: str, role: str, agent: str | None) -> str | None:
+    record = Path(prompt.removesuffix(".prompt.md") + ".json")
+    if role == "judge" or not agent or not record.exists():
+        return None
+    cwd = json.loads(record.read_text(encoding="utf-8"))["cwd"]
+    match = WORKSPACE.match(os.path.realpath(cwd))
+    if match is None:
+        return f"{prompt} belongs to a judge."
+    if _claim(Path(match["run"]) / "claims", agent, match["fighter"]) != match["fighter"]:
+        return f"{prompt} belongs to another fighter."
+    return None
 
 
 def check(payload: dict[str, Any], role: str) -> str | None:
     tool = payload["tool_name"]
     tool_input = payload["tool_input"]
     target = tool_input.get("file_path" if tool in FILE_TOOLS else "path")
-    if not target:
+    if not target or target.startswith("~"):
         return "Pass an absolute path inside your folder."
     if _escapes(tool_input.get("glob")) or (tool == "Glob" and _escapes(tool_input.get("pattern"))):
         return "Search patterns must stay inside your folder."
 
-    resolved = os.path.realpath(os.path.join(payload["cwd"], target))
+    cwd = os.path.realpath(payload["cwd"])
+    resolved = os.path.realpath(os.path.join(cwd, target))
+    run = RUN_FOLDER.match(resolved)
+    if run and not _owns_run(run["run"], run["home"], cwd):
+        return f"{resolved} belongs to another project's battle."
     if tool == "Read" and PROMPT_FILE.match(resolved):
-        return None
+        return _check_prompt(resolved, role, payload.get("agent_id"))
     if role == "judge":
-        return None if RUN_FOLDER.match(resolved) else f"{resolved} is outside this battle's folder."
+        return None if run else f"{resolved} is outside this battle's folder."
 
     match = WORKSPACE.match(resolved)
     if match is None:

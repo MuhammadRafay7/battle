@@ -1,5 +1,6 @@
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -98,6 +99,36 @@ def test_agents_can_read_their_prompt_file(project, role):
     assert check(call(project, "Read", file_path=str(prompt)), role) is None
 
 
+def job_prompt(project, name, cwd):
+    jobs = project / ".battle" / "runs" / "r1" / "jobs"
+    write(jobs / f"{name}.json", json.dumps({"cwd": str(cwd)}))
+    return write(jobs / f"{name}.prompt.md", "task")
+
+
+def test_reading_its_prompt_ties_a_fighter_to_that_workspace(project):
+    prompt = job_prompt(project, "1", workspace(project))
+    assert check(call(project, "Read", file_path=str(prompt)), "fighter") is None
+
+    rival = workspace(project, "A2") / "app.py"
+    assert "another fighter" in check(call(project, "Read", file_path=str(rival)), "fighter")
+
+
+def test_fighter_cannot_read_a_rivals_prompt(project):
+    own = job_prompt(project, "1", workspace(project))
+    rival = job_prompt(project, "2", workspace(project, "A2"))
+    check(call(project, "Read", file_path=str(own)), "fighter")
+
+    assert "another fighter" in check(call(project, "Read", file_path=str(rival)), "fighter")
+
+
+def test_fighter_cannot_read_a_judges_prompt(project):
+    review = project / ".battle" / "runs" / "r1" / "review" / "group-A"
+    prompt = job_prompt(project, "3", review)
+
+    assert "judge" in check(call(project, "Read", file_path=str(prompt)), "fighter")
+    assert check(call(project, "Read", file_path=str(prompt)), "judge") is None
+
+
 def test_fighter_cannot_change_a_prompt_file(project):
     prompt = write(project / ".battle" / "runs" / "r1" / "jobs" / "0001.prompt.md", "task")
     assert check(call(project, "Write", file_path=str(prompt)), "fighter")
@@ -138,6 +169,108 @@ def test_judge_cannot_read_secrets_in_the_real_project(project):
 def test_judge_cannot_search_the_real_project(project):
     assert check(call(project, "Grep", path=str(project), pattern="API_KEY"), "judge")
     assert check(call(project, "Grep", pattern="API_KEY"), "judge")
+
+
+@pytest.mark.parametrize("role", ["fighter", "judge"])
+def test_a_battle_cannot_reach_another_projects_run(tmp_path, project, role):
+    other = write(tmp_path / "other" / ".battle" / "runs" / "r9" / "baseline" / "app.py", "x")
+    assert "another project" in check(call(project, "Read", file_path=str(other)), role)
+
+
+def test_a_prompt_file_of_another_project_is_blocked(tmp_path, project):
+    prompt = write(tmp_path / "other" / ".battle" / "runs" / "r9" / "jobs" / "1.prompt.md", "x")
+    assert check(call(project, "Read", file_path=str(prompt)), "judge")
+
+
+def test_a_chat_in_a_subfolder_still_reaches_its_own_run(project):
+    baseline = project / ".battle" / "runs" / "r1" / "baseline" / "app.py"
+    assert check(call(project / "src", "Read", file_path=str(baseline)), "judge") is None
+
+
+@pytest.mark.parametrize("role", ["fighter", "judge"])
+def test_a_home_path_is_blocked_before_the_tool_can_expand_it(project, role):
+    payload = call(project, "Read", file_path="~/.battle/runs/old/baseline/.env")
+    assert check(payload, role)
+
+
+@pytest.mark.parametrize("pattern", ["{/etc,/root}/*", "{src,~/.ssh}/*"])
+def test_brace_patterns_cannot_escape(project, pattern):
+    payload = call(project, "Glob", path=str(workspace(project)), pattern=pattern)
+    assert check(payload, "fighter")
+
+
+def test_ordinary_brace_patterns_are_allowed(project):
+    payload = call(project, "Glob", path=str(workspace(project)), pattern="src/{a,b}/*.py")
+    assert check(payload, "fighter") is None
+
+
+def test_a_fake_run_inside_a_rivals_workspace_does_not_change_the_owner(project):
+    check(call(project, "Read", file_path=str(workspace(project) / "app.py")), "fighter")
+    run = workspace(project, "A2") / ".battle" / "runs" / "fake"
+    nested = write(run / "workspace" / "A1" / "app.py", "x")
+    assert "another fighter" in check(call(project, "Write", file_path=str(nested)), "fighter")
+
+
+def test_a_fake_prompt_inside_a_rivals_workspace_is_not_a_prompt(project):
+    check(call(project, "Read", file_path=str(workspace(project) / "app.py")), "fighter")
+    run = workspace(project, "A2") / ".battle" / "runs" / "fake"
+    fake = write(run / "jobs" / "0001.prompt.md", "x")
+    assert "another fighter" in check(call(project, "Read", file_path=str(fake)), "fighter")
+
+
+def test_a_chosen_battle_home_outside_the_project_stays_reachable(tmp_path, project, monkeypatch):
+    home = tmp_path / "elsewhere" / ".battle"
+    target = write(home / "runs" / "r1" / "baseline" / "app.py", "x")
+    monkeypatch.setenv("BATTLE_HOME", str(home))
+    assert check(call(project, "Read", file_path=str(target)), "judge") is None
+
+
+def saved_run(home, project, name):
+    run = home / "runs" / name
+    write(run / "state.json", json.dumps({"project": str(project)}))
+    return write(run / "baseline" / "app.py", "x")
+
+
+@pytest.mark.parametrize("role", ["fighter", "judge"])
+def test_the_shared_home_folder_does_not_open_another_projects_run(tmp_path, role):
+    user = tmp_path / "user"
+    other = saved_run(user / ".battle", user / "other", "r9")
+    payload = call(user / "mine", "Read", file_path=str(other))
+    assert "another project" in check(payload, role)
+
+
+def test_a_shared_battle_home_still_separates_projects(tmp_path, project, monkeypatch):
+    home = tmp_path / "elsewhere" / ".battle"
+    monkeypatch.setenv("BATTLE_HOME", str(home))
+    other = saved_run(home, tmp_path / "other", "r9")
+    assert "another project" in check(call(project, "Read", file_path=str(other)), "judge")
+
+
+def test_a_run_in_a_shared_home_is_reachable_from_its_own_project(tmp_path, project):
+    mine = saved_run(tmp_path / "user" / ".battle", project, "r1")
+    assert check(call(project / "src", "Read", file_path=str(mine)), "judge") is None
+
+
+def test_a_chat_above_the_project_still_reaches_its_own_run(tmp_path):
+    repo = tmp_path / "repo"
+    mine = saved_run(tmp_path / "user" / ".battle", repo / "pkg", "r1")
+    assert check(call(repo, "Read", file_path=str(mine)), "judge") is None
+
+
+def test_an_unreadable_run_state_is_blocked(project):
+    state = write(project / ".battle" / "runs" / "r1" / "state.json", "not json")
+    payload = call(project, "Read", file_path=str(state.parent / "baseline" / "app.py"))
+    assert run_script("judge", json.dumps(payload)).returncode == 2
+
+
+def test_parallel_calls_from_one_agent_never_block_each_other(project):
+    payload = call(project, "Read", file_path=str(workspace(project) / "app.py"))
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(lambda _: check(payload, "fighter"), range(64)))
+
+    assert results == [None] * 64
+    claims = project / ".battle" / "runs" / "r1" / "claims"
+    assert [path.name for path in claims.iterdir()] == ["agent-1"]
 
 
 def run_script(role, stdin):

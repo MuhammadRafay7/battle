@@ -1,4 +1,7 @@
 import json
+import os
+import stat
+import threading
 
 import pytest
 
@@ -97,9 +100,84 @@ def test_lock_stops_a_second_process_on_the_same_run(home, tmp_path):
                 pass
 
 
+def test_taking_the_lock_picks_up_what_another_process_saved(home, tmp_path):
+    stale = new_run(tmp_path)
+    RunStore.open(stale.id).put("from-the-engine", {"done": True})
+
+    with stale.lock():
+        stale.put("from-undo", {"done": True})
+
+    reopened = RunStore.open(stale.id)
+    assert reopened.has("from-the-engine")
+    assert reopened.has("from-undo")
+
+
 def test_lock_is_released_after_use(home, tmp_path):
     store = new_run(tmp_path)
     with store.lock():
         pass
     with RunStore.open(store.id).lock():
         pass
+
+
+def test_a_passing_status_check_does_not_look_like_a_running_battle(home, tmp_path):
+    store = new_run(tmp_path)
+    holder = RunStore.open(store.id)
+    entered, release = threading.Event(), threading.Event()
+
+    def hold_briefly():
+        with holder.lock():
+            entered.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=hold_briefly)
+    thread.start()
+    entered.wait(5)
+    threading.Timer(0.05, release.set).start()
+
+    with store.lock():
+        assert release.is_set()
+    thread.join()
+
+
+def test_forget_removes_steps_for_good(home, tmp_path):
+    store = new_run(tmp_path)
+    store.put("group-A/r1/A1", {"forfeit": True})
+    store.put("group-A/r1/A2", {"summary": "done"})
+
+    store.forget(["group-A/r1/A1"])
+
+    reopened = RunStore.open(store.id)
+    assert not reopened.has("group-A/r1/A1")
+    assert reopened.has("group-A/r1/A2")
+
+
+def test_a_save_reaches_the_disk_before_it_replaces_the_old_state(home, tmp_path, monkeypatch):
+    store = new_run(tmp_path)
+    calls = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(descriptor):
+        calls.append("fsync")
+        real_fsync(descriptor)
+
+    def replace(source, target):
+        calls.append("replace")
+        real_replace(source, target)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+
+    store.set_status("paused")
+
+    assert calls == ["fsync", "replace", "fsync"]
+
+
+def test_a_run_id_cannot_climb_out_of_the_runs_folder(home, tmp_path):
+    store = new_run(tmp_path)
+    with pytest.raises(RunNotFound):
+        RunStore.open(f"../runs/{store.id}")
+
+
+def test_only_you_can_read_a_runs_copy_of_your_project(home, tmp_path):
+    assert stat.S_IMODE(new_run(tmp_path).root.stat().st_mode) == 0o700

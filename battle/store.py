@@ -6,8 +6,35 @@ import fcntl
 import json
 import os
 import threading
+import time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
+
+LOCK_WAIT_SECONDS = 0.25
+LOCK_RETRY_SECONDS = 0.01
+
+
+def sync_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def sync_folder(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        sync_file(path)
+
+
+def write_durable(path: Path, text: str) -> None:
+    partial = path.with_name(path.name + ".partial")
+    with partial.open("w", encoding="utf-8", errors="backslashreplace") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(partial, path)
+    sync_folder(path.parent)
 
 
 class RunNotFound(Exception):
@@ -50,7 +77,7 @@ class RunStore:
         now = datetime.datetime.now(datetime.timezone.utc)
         run_id = now.strftime("%Y%m%d-%H%M%S-%f")
         root = (home / "runs" if home else _runs_folder()) / run_id
-        root.mkdir(parents=True)
+        root.mkdir(parents=True, mode=0o700)
         store = cls(
             root,
             {
@@ -70,7 +97,7 @@ class RunStore:
     def open(cls, run_id: str) -> "RunStore":
         root = _runs_folder() / run_id
         state_file = root / "state.json"
-        if not state_file.exists():
+        if Path(run_id).name != run_id or not state_file.exists():
             raise RunNotFound(f"No battle called {run_id}.")
         return cls(root, json.loads(state_file.read_text(encoding="utf-8")))
 
@@ -109,6 +136,12 @@ class RunStore:
             self.steps[key] = value
             self._save()
 
+    def forget(self, keys: Iterable[str]) -> None:
+        with self._guard:
+            for key in keys:
+                self.steps.pop(key, None)
+            self._save()
+
     def set_status(self, status: str) -> None:
         with self._guard:
             self._state["status"] = status
@@ -121,10 +154,17 @@ class RunStore:
     @contextlib.contextmanager
     def lock(self) -> Iterator[None]:
         with (self.root / "lock").open("w") as handle:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise AlreadyRunning(f"Battle {self.id} is already running.") from error
+            deadline = time.monotonic() + LOCK_WAIT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as error:
+                    if time.monotonic() >= deadline:
+                        raise AlreadyRunning(f"Battle {self.id} is already running.") from error
+                    time.sleep(LOCK_RETRY_SECONDS)
+            with self._guard:
+                self._state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
             yield
 
     def engine_running(self) -> bool:
@@ -139,6 +179,4 @@ class RunStore:
             return False
 
     def _save(self) -> None:
-        temporary = self.root / "state.json.partial"
-        temporary.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
-        os.replace(temporary, self.root / "state.json")
+        write_durable(self.root / "state.json", json.dumps(self._state, indent=2))

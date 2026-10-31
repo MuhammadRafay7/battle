@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import json
 import shutil
+import signal
 import string
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, TypeVar
+from typing import Any, Callable, Iterable, NoReturn, TypeVar
 
 from battle import prompts, report
 from battle.agents import (
     DEFAULT_TIMEOUT,
     Agent,
     AgentError,
+    AgentStopped,
     Job,
     UsageLimitReached,
     extract_json,
@@ -23,6 +25,7 @@ from battle.sizing import Bracket
 from battle.store import RunStore
 from battle.workspace import (
     ApplyConflict,
+    ApplyRefused,
     add_rivals,
     apply_entry,
     capture,
@@ -51,7 +54,7 @@ class BattleError(Exception):
     pass
 
 
-class _Stopped(Exception):
+class Stopped(Exception):
     pass
 
 
@@ -101,6 +104,7 @@ class Fight:
         self.limit = max(1, limit)
         self._slots = threading.BoundedSemaphore(self.limit)
         self._stop = threading.Event()
+        self.stop_signal: int | None = None
         self.bracket = Bracket(
             settings["groups"],
             settings["fighters"],
@@ -122,7 +126,7 @@ class Fight:
         fought = self._each(groups, lambda item: self._group_fight(item[0], *item[1]))
         results = [result for result in fought if result is not None]
         if not results:
-            raise BattleError("No fighter finished the group stage.")
+            self._give_up("group-", "No fighter finished the group stage.")
 
         finalists, entries = self._check_verdicts(results)
         final = self._final(finalists, entries)
@@ -132,6 +136,16 @@ class Fight:
     def _say(self, message: str) -> None:
         self._log(message)
         self.store.note(message)
+
+    def _give_up(self, stage: str, message: str) -> NoReturn:
+        self.store.forget(
+            [
+                key
+                for key, value in self.store.steps.items()
+                if key.startswith(stage) and isinstance(value, dict) and value.get("forfeit")
+            ]
+        )
+        raise BattleError(message)
 
     def _prepare_baseline(self) -> None:
         if self.baseline.exists():
@@ -159,6 +173,10 @@ class Fight:
             names = [item["name"] for item in value["directions"]]
             if len(names) != count or len(set(names)) != count or not all(names):
                 raise ValueError(f"Give exactly {count} directions with different names.")
+            for item in value["directions"]:
+                texts = (item["name"], item["brief"])
+                if not all(isinstance(text, str) and text.strip() for text in texts):
+                    raise ValueError("Every direction needs a text name and brief.")
 
         self._say("Setup: choosing a different direction for each group.")
         job = Job(
@@ -371,7 +389,7 @@ class Fight:
                 if not isinstance(attack, dict):
                     continue
                 target = attack.get("target")
-                if target not in ids or target == fighter.id:
+                if not isinstance(target, str) or target not in ids or target == fighter.id:
                     continue
                 if str(attack.get("problem", "")).strip() and str(attack.get("evidence", "")).strip():
                     valid.append({**attack, "from": fighter.id})
@@ -407,6 +425,8 @@ class Fight:
         by_id = {fighter.id: fighter for result in results for fighter in result.alive}
 
         def check(value: dict[str, Any]) -> None:
+            if set(value["rulings"]) != set(by_group):
+                raise ValueError(f"Rule on exactly these groups: {', '.join(by_group)}.")
             winners = set()
             for group, result in by_group.items():
                 winner = value["rulings"][group]["winner"]
@@ -448,7 +468,7 @@ class Fight:
     def _pick_champion(self, final: Standing) -> str:
         ids = [fighter.id for fighter in final.alive]
         if not ids:
-            raise BattleError("No fighter finished the final.")
+            self._give_up("final/", "No fighter finished the final.")
         if len(ids) == 1:
             if not self.store.has("champion"):
                 self.store.put("champion", {"champion": ids[0], "reason": "Last fighter standing."})
@@ -487,19 +507,24 @@ class Fight:
         return self._ask_json(f"verdict/{category}", job, check)
 
     def _finish(self, champion: str, entry: Path) -> dict[str, Any]:
+        if self._stop.is_set():
+            raise Stopped
         root = self.store.root
         if not (root / "champion").exists():
-            shutil.copytree(entry, root / "champion")
+            partial = root / "champion.partial"
+            shutil.rmtree(partial, ignore_errors=True)
+            shutil.copytree(entry, partial)
+            partial.rename(root / "champion")
         if not self.store.has("result"):
             if self.store.settings.get("apply", True):
                 apply_champion(self.store)
             else:
                 self.store.put("result", {"applied": False, "reason": "Run with --no-apply."})
+        report.write(self.store)
+        self.store.set_status("done")
         if not self.store.settings.get("keep", False):
             for folder in ("workspace", "review", "entries"):
                 shutil.rmtree(root / folder, ignore_errors=True)
-        report.write(self.store)
-        self.store.set_status("done")
         return {"champion": champion, **self.store.get("result")}
 
     def _ask_json(
@@ -525,6 +550,13 @@ class Fight:
                 return value
         raise BattleError(f"{key} failed twice. {problem}")
 
+    def stop(self, signum: int) -> None:
+        if self.stop_signal is not None:
+            return
+        self.stop_signal = signum
+        self._halt()
+        self._say(f"Stopping on {signal.Signals(signum).name}.")
+
     def _halt(self) -> None:
         self._stop.set()
         for agent in self.agents:
@@ -535,10 +567,15 @@ class Fight:
     def _run_agent(self, agent: Agent, job: Job, label: str | None = None) -> str:
         with self._slots:
             if self._stop.is_set():
-                raise _Stopped
+                raise Stopped
             if label:
                 self._say(f"{label} started.")
-            return agent.run(job)
+            try:
+                return agent.run(job)
+            except AgentError as error:
+                if isinstance(error, AgentStopped) or self._stop.is_set():
+                    raise Stopped from error
+                raise
 
     def _each(
         self, items: Iterable[Item], work: Callable[[Item], Result]
@@ -547,10 +584,10 @@ class Fight:
 
         def guarded(item: Item) -> Result:
             if self._stop.is_set():
-                raise _Stopped
+                raise Stopped
             try:
                 return work(item)
-            except _Stopped:
+            except Stopped:
                 raise
             except BaseException:
                 self._halt()
@@ -560,21 +597,32 @@ class Fight:
             futures = [pool.submit(guarded, item) for item in listed]
         errors = [error for future in futures if (error := future.exception()) is not None]
         for error in errors:
-            if not isinstance(error, _Stopped):
+            if not isinstance(error, Stopped):
                 raise error
         if errors:
             raise errors[0]
         return [future.result() for future in futures]
 
 
+def roll_back_cut_off_apply(store: RunStore) -> bool:
+    backup = store.root / "backup"
+    if not backup.exists() or store.steps.get("result", {}).get("applied"):
+        return False
+    undo_apply(backup, store.project)
+    return True
+
+
 def apply_champion(store: RunStore, force: bool = False) -> dict[str, Any]:
     root = store.root
     try:
+        roll_back_cut_off_apply(store)
         changes = apply_entry(
             root / "champion", root / "baseline", store.project, root / "backup", force
         )
     except ApplyConflict as conflict:
         outcome: dict[str, Any] = {"applied": False, "conflicts": conflict.paths}
+    except ApplyRefused as refusal:
+        outcome = {"applied": False, "refused": str(refusal)}
     else:
         outcome = {"applied": True, **changes}
     store.put("result", outcome)
@@ -583,6 +631,7 @@ def apply_champion(store: RunStore, force: bool = False) -> dict[str, Any]:
 
 
 def undo_champion(store: RunStore) -> None:
-    undo_apply(store.root / "backup", store.project)
+    if (store.root / "backup").exists():
+        undo_apply(store.root / "backup", store.project)
     store.put("result", {"applied": False, "reason": "Undone."})
     report.write(store)

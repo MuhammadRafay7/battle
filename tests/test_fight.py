@@ -1,4 +1,6 @@
+import json
 import re
+import signal
 import threading
 import time
 import tomllib
@@ -8,11 +10,12 @@ from pathlib import Path
 
 import pytest
 
-from battle import prompts
-from battle.agents import UsageLimitReached
-from battle.fight import BattleError, Fight, apply_champion
+from battle import prompts, report
+from battle.agents import AgentError, AgentStopped, UsageLimitReached
+from battle.fight import BattleError, Fight, Fighter, Stopped, apply_champion
 from battle.sizing import Bracket
 from battle.store import RunStore
+from battle.workspace import apply_entry
 from tests.fake_agent import FakeAgent
 
 BRACKET = Bracket(groups=2, fighters=3, rounds=2, final_rounds=1)
@@ -592,3 +595,248 @@ def test_secrets_never_reach_a_fighter(project):
 
     assert not any(seen)
     assert (project / ".env").read_text() == "API_KEY=secret"
+
+
+class HangingAgent(FakeAgent):
+    def __post_init__(self):
+        super().__post_init__()
+        self.crashed = set()
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+
+    def cancel(self):
+        self.cancelled.set()
+
+    def _fighter(self, job):
+        fighter = re.search(r"You are fighter (\w+)", job.prompt).group(1)
+        with self._guard:
+            first_attempt = fighter not in self.crashed
+            self.crashed.add(fighter)
+        if first_attempt:
+            raise AgentError("crashed once")
+        self.started.set()
+        self.cancelled.wait(10)
+        raise AgentStopped("killed by the stop")
+
+
+def stop_when_started(agent, fight):
+    def stop():
+        agent.started.wait(10)
+        fight.stop(signal.SIGTERM)
+
+    thread = threading.Thread(target=stop)
+    thread.start()
+    return thread
+
+
+def test_a_stop_during_the_last_attempt_is_not_a_forfeit(project):
+    agent = HangingAgent()
+    store, fight = battle(project, agent)
+    stopper = stop_when_started(agent, fight)
+
+    with pytest.raises(Stopped):
+        fight.run()
+    stopper.join()
+
+    assert agent.cancelled.is_set()
+    assert fight.stop_signal == signal.SIGTERM
+    assert not any(step.get("forfeit") for step in store.steps.values())
+
+
+def test_a_stopped_battle_resumes_with_every_fighter(project):
+    agent = HangingAgent()
+    store, fight = battle(project, agent)
+    stopper = stop_when_started(agent, fight)
+    with pytest.raises(Stopped):
+        fight.run()
+    stopper.join()
+
+    second = FakeAgent(champion="B3")
+    result = Fight(RunStore.open(store.id), [second], limit=3, log=lambda message: None).run()
+
+    assert result["champion"] == "B3"
+    assert len(fighter_prompts(second, "A1")) == 2
+
+
+def test_a_stop_after_the_last_judge_leaves_the_project_alone(project):
+    agent = FakeAgent()
+    store, fight = battle(project, agent)
+    answer = agent._head_champion
+
+    def stop_then_answer(job):
+        fight.stop(signal.SIGINT)
+        return answer(job)
+
+    agent._head_champion = stop_then_answer
+
+    with pytest.raises(Stopped):
+        fight.run()
+
+    assert not list(project.glob("work_*.txt"))
+    assert not store.has("result")
+
+
+def test_an_attack_with_an_unhashable_target_is_thrown_out():
+    fighters = [Fighter(name, "A", {}, "angle", FakeAgent()) for name in ("A1", "A2")]
+    attack = {"target": ["A2"], "problem": "hole", "evidence": "line 1"}
+    results = {"A1": {"attacks": [attack]}, "A2": {"attacks": []}}
+
+    assert Fight._valid_attacks(fighters, results) == []
+
+
+def test_the_first_signal_decides_how_a_battle_stopped(project):
+    _, fight = battle(project, FakeAgent())
+
+    fight.stop(signal.SIGTERM)
+    fight.stop(signal.SIGINT)
+
+    assert fight.stop_signal == signal.SIGTERM
+
+
+def test_a_blank_direction_brief_gets_a_retry(project):
+    agent = FakeAgent()
+    answer = agent._director
+    blank = {"directions": [{"name": "One", "brief": "  "}, {"name": "Two", "brief": "ok"}]}
+    replies = [json.dumps(blank)]
+    agent._director = lambda job: replies.pop() if replies else answer(job)
+    store, fight = battle(project, agent)
+
+    fight.run()
+
+    assert len(prompts_for(agent, "director")) == 2
+    assert store.status == "done"
+
+
+def test_a_direction_without_a_brief_is_retried(project):
+    agent = FakeAgent()
+    store, fight = battle(project, agent)
+    answer = agent._director
+    calls = []
+
+    def director(job):
+        calls.append(job)
+        if len(calls) == 1:
+            return json.dumps({"directions": [{"name": "One"}, {"name": "Two"}]})
+        return answer(job)
+
+    agent._director = director
+    fight.run()
+
+    assert len(calls) == 2
+    assert store.status == "done"
+
+
+def test_a_ruling_on_an_unknown_group_is_retried(project):
+    agent = FakeAgent()
+    store, fight = battle(project, agent)
+    answer = agent._head_check
+    calls = []
+
+    def head_check(job):
+        calls.append(job)
+        body = json.loads(answer(job))
+        if len(calls) == 1:
+            body["rulings"]["Z"] = {}
+        return json.dumps(body)
+
+    agent._head_check = head_check
+    fight.run()
+
+    assert len(calls) == 2
+    assert store.status == "done"
+
+
+def test_a_failed_report_leaves_entries_so_the_battle_can_resume(project, monkeypatch):
+    store, fight = battle(project, FakeAgent(), apply=False)
+
+    def broken(_store):
+        raise OSError("disk full")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(report, "write", broken)
+        with pytest.raises(OSError):
+            fight.run()
+
+    assert (store.root / "entries").exists()
+    resumed = Fight(RunStore.open(store.id), [FakeAgent()], limit=3, log=lambda message: None)
+    assert resumed.run()["applied"] is False
+
+
+class ErrorOnStopAgent(FakeAgent):
+    def __post_init__(self):
+        super().__post_init__()
+        self.fight = None
+
+    def _fighter(self, job):
+        self.fight.stop(signal.SIGTERM)
+        raise AgentError("the chat reported a failure after the stop")
+
+
+def test_an_ordinary_error_during_a_stop_is_not_a_forfeit(project):
+    agent = ErrorOnStopAgent()
+    store, fight = battle(project, agent)
+    agent.fight = fight
+
+    with pytest.raises(Stopped):
+        fight.run()
+
+    assert not any(step.get("forfeit") for step in store.steps.values())
+
+
+ALL_FIGHTERS = ("A1", "A2", "A3", "B1", "B2", "B3")
+
+
+def test_resume_retries_fighters_lost_to_a_total_wipeout(project):
+    store, fight = battle(project, FakeAgent(fail=ALL_FIGHTERS))
+    with pytest.raises(BattleError, match="group stage"):
+        fight.run()
+
+    second = FakeAgent(champion="B3")
+    result = Fight(RunStore.open(store.id), [second], limit=3, log=lambda message: None).run()
+
+    assert result["champion"] == "B3"
+    assert (project / "work_B3.txt").exists()
+
+
+def test_resume_retries_a_final_every_finalist_lost(project):
+    agent = FakeAgent()
+    store, fight = battle(project, agent)
+    work = agent._fighter
+
+    def fail_in_the_final(job):
+        if "group" not in job.label:
+            raise AgentError("outage")
+        return work(job)
+
+    agent._fighter = fail_in_the_final
+    with pytest.raises(BattleError, match="the final"):
+        fight.run()
+
+    second = FakeAgent(champion="B3")
+    result = Fight(RunStore.open(store.id), [second], limit=3, log=lambda message: None).run()
+
+    assert result["champion"] == "B3"
+
+
+def test_an_apply_cut_off_by_a_crash_is_redone_cleanly(project):
+    store, fight = battle(project, FakeAgent(champion="B3"), apply=False)
+    fight.run()
+    root = store.root
+    apply_entry(root / "champion", root / "baseline", project, root / "backup")
+    (project / "work_B3.txt").unlink()
+
+    outcome = apply_champion(store)
+
+    assert outcome["applied"] is True
+    assert (project / "work_B3.txt").exists()
+
+
+def test_a_leftover_partial_champion_is_never_used(project):
+    store, fight = battle(project, FakeAgent())
+    (store.root / "champion.partial").mkdir()
+    (store.root / "champion.partial" / "junk").write_text("half a copy")
+
+    fight.run()
+
+    assert not (store.root / "champion" / "junk").exists()
+    assert not (store.root / "champion.partial").exists()

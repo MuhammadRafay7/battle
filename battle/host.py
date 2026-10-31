@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from battle.agents import AgentError, Job, UsageLimitReached
+from battle.agents import AgentError, AgentStopped, Job, UsageLimitReached
 
 SUBAGENT_MODELS = ("fable", "opus", "sonnet", "haiku")
 REPLY = ".reply"
@@ -76,7 +76,7 @@ class HostAgent:
 
     def __post_init__(self) -> None:
         self._guard = threading.Lock()
-        self._count = 0
+        self._count = time.time_ns()
         self._cancelled = threading.Event()
 
     def cancel(self) -> None:
@@ -88,7 +88,7 @@ class HostAgent:
     def _publish(self, job: Job) -> str:
         with self._guard:
             self._count += 1
-            job_id = f"{self._count:04d}"
+            job_id = str(self._count)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         prompt_file = self.jobs_dir / f"{job_id}.prompt.md"
         _write(
@@ -117,7 +117,7 @@ class HostAgent:
                 if path.exists():
                     return self._read(path, suffix)
             if self._cancelled.is_set():
-                raise AgentError(f"Battle stopped job {job_id}.")
+                raise AgentStopped(f"Battle stopped job {job_id}.")
             if time.monotonic() >= deadline:
                 raise AgentError(f"Job {job_id} timed out after {timeout:g} seconds.")
             time.sleep(self.poll_seconds)

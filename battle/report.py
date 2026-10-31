@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from battle.prompts import CATEGORIES
-from battle.store import RunStore
+from battle.store import RunStore, write_durable
 
 
 def _group_section(group: str, verdict: dict[str, Any], direction: str) -> list[str]:
@@ -49,7 +49,8 @@ def _result_section(result: dict[str, Any]) -> list[str]:
     if result.get("conflicts"):
         files = ", ".join(result["conflicts"])
         return [f"Not applied. These files changed during the battle: {files}.", ""]
-    return [f"Not applied. {result.get('reason', '')}".strip(), ""]
+    reason = result.get("refused") or result.get("reason", "")
+    return [f"Not applied. {reason}".strip(), ""]
 
 
 def _overturned(steps: dict[str, Any]) -> list[str]:
@@ -106,4 +107,4 @@ def render(store: RunStore) -> str:
 
 
 def write(store: RunStore) -> None:
-    (store.root / "report.md").write_text(render(store), encoding="utf-8")
+    write_durable(store.root / "report.md", render(store))
