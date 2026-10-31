@@ -47,6 +47,42 @@ def test_plan_shows_the_size_without_running_anything(capsys):
     assert latest_run() is None
 
 
+def test_plan_lets_every_fighter_run_at_once_when_memory_allows(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "free_memory_mb", lambda: 64_000)
+
+    cli.main(["plan"])
+
+    output = capsys.readouterr().out
+    assert "3 groups of 4" in output
+    assert "up to 12 agents run at once" in output
+
+
+def test_plan_caps_agents_when_memory_is_short(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "free_memory_mb", lambda: 2_012)
+
+    cli.main(["plan"])
+
+    assert "up to 3 agents run at once" in capsys.readouterr().out
+
+
+def test_at_once_overrides_the_memory_check(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "free_memory_mb", lambda: 64_000)
+
+    cli.main(["plan", "--at-once", "2"])
+
+    assert "up to 2 agents run at once" in capsys.readouterr().out
+
+
+def test_at_once_is_saved_so_resume_keeps_it(project, capsys):
+    run_battle(project, "--at-once", "2")
+    assert RunStore.open(latest_run()).settings["at_once"] == 2
+
+
+def test_at_once_must_be_at_least_one(capsys):
+    assert cli.main(["plan", "--at-once", "0"]) == 1
+    assert "at-once" in capsys.readouterr().err
+
+
 def test_plan_accepts_a_custom_size(capsys):
     cli.main(["plan", "--groups", "3", "--fighters", "2"])
     assert "3 groups of 2" in capsys.readouterr().out
@@ -235,4 +271,4 @@ def test_launcher_works_through_a_symlink_from_any_folder(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "2 groups of 4" in result.stdout
+    assert "3 groups of 4" in result.stdout

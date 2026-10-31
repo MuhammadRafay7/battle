@@ -51,6 +51,10 @@ class BattleError(Exception):
     pass
 
 
+class _Stopped(Exception):
+    pass
+
+
 @dataclass(frozen=True)
 class Fighter:
     id: str
@@ -95,6 +99,8 @@ class Fight:
         self.agents = agents
         self.judge = agents[0]
         self.limit = max(1, limit)
+        self._slots = threading.BoundedSemaphore(self.limit)
+        self._stop = threading.Event()
         self.bracket = Bracket(
             settings["groups"],
             settings["fighters"],
@@ -112,11 +118,9 @@ class Fight:
         self._prepare_baseline()
         directions = self._choose_directions()
         letters = string.ascii_uppercase[: self.bracket.groups]
-        results = [
-            result
-            for index, (group, direction) in enumerate(zip(letters, directions))
-            if (result := self._group_fight(index, group, direction)) is not None
-        ]
+        groups = list(enumerate(zip(letters, directions)))
+        fought = self._each(groups, lambda item: self._group_fight(item[0], *item[1]))
+        results = [result for result in fought if result is not None]
         if not results:
             raise BattleError("No fighter finished the group stage.")
 
@@ -292,9 +296,15 @@ class Fight:
             )
 
         workspace = self.store.root / "workspace" / fighter.id
+        label = f"{fighter.id} ({scope} round {number})"
         try:
             reply = self._attempt_turn(
-                fighter, self._preamble + prompt, entries.get(fighter.id), rivals, workspace
+                fighter,
+                self._preamble + prompt,
+                entries.get(fighter.id),
+                rivals,
+                workspace,
+                label,
             )
             if reply is None:
                 result = {"forfeit": True, "reason": "It failed twice."}
@@ -303,6 +313,10 @@ class Fight:
                     self.baseline, workspace, self._entry_path(scope, number, fighter.id)
                 )
                 result = self._read_turn(fighter, reply, changes)
+                self._say(
+                    f"{label} finished: {len(changes['changed'])} files changed, "
+                    f"{len(result['attacks'])} attacks."
+                )
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
         self.store.put(key, result)
@@ -315,13 +329,14 @@ class Fight:
         entry: Path | None,
         rivals: dict[str, Path],
         workspace: Path,
+        label: str,
     ) -> str | None:
         for attempt in range(1, ATTEMPTS + 1):
             materialize(self.baseline, entry, workspace)
             add_rivals(workspace, rivals)
             job = Job("fighter", prompt, workspace, writes=True, timeout=self.timeout)
             try:
-                return fighter.agent.run(job)
+                return self._run_agent(fighter.agent, job, label)
             except UsageLimitReached:
                 raise
             except AgentError as error:
@@ -494,7 +509,7 @@ class Fight:
         for _ in range(ATTEMPTS):
             attempt = replace(job, prompt=job.prompt + (prompts.retry(problem) if problem else ""))
             try:
-                reply = self.judge.run(attempt)
+                reply = self._run_agent(self.judge, attempt)
                 value = extract_json(reply)
                 check(value)
             except UsageLimitReached:
@@ -508,26 +523,38 @@ class Fight:
                 return value
         raise BattleError(f"{key} failed twice. {problem}")
 
+    def _run_agent(self, agent: Agent, job: Job, label: str | None = None) -> str:
+        with self._slots:
+            if self._stop.is_set():
+                raise _Stopped
+            if label:
+                self._say(f"{label} started.")
+            return agent.run(job)
+
     def _each(
         self, items: Iterable[Item], work: Callable[[Item], Result]
     ) -> list[Result]:
-        stop = threading.Event()
+        listed = list(items)
 
-        def guarded(item: Item) -> Result | None:
-            if stop.is_set():
-                return None
+        def guarded(item: Item) -> Result:
+            if self._stop.is_set():
+                raise _Stopped
             try:
                 return work(item)
+            except _Stopped:
+                raise
             except BaseException:
-                stop.set()
+                self._stop.set()
                 raise
 
-        with ThreadPoolExecutor(max_workers=self.limit) as pool:
-            futures = [pool.submit(guarded, item) for item in items]
-        for future in futures:
-            error = future.exception()
-            if error is not None:
+        with ThreadPoolExecutor(max_workers=max(1, len(listed))) as pool:
+            futures = [pool.submit(guarded, item) for item in listed]
+        errors = [error for future in futures if (error := future.exception()) is not None]
+        for error in errors:
+            if not isinstance(error, _Stopped):
                 raise error
+        if errors:
+            raise errors[0]
         return [future.result() for future in futures]
 
 

@@ -12,12 +12,12 @@ from battle.sizing import (
 
 
 def test_presets_match_the_two_tournament_sizes():
-    assert PRESETS["default"] == Bracket(groups=2, fighters=4)
+    assert PRESETS["default"] == Bracket(groups=3, fighters=4)
     assert PRESETS["big"] == Bracket(groups=4, fighters=5)
 
 
 def test_estimated_runs_counts_every_agent_in_the_tournament():
-    assert PRESETS["default"].estimated_runs() == 38
+    assert PRESETS["default"].estimated_runs() == 53
     assert PRESETS["big"].estimated_runs() == 80
 
 
@@ -55,6 +55,11 @@ def test_fighters_at_once_uses_group_size_when_ram_is_unknown():
 
 def test_parse_meminfo_reads_available_memory():
     assert parse_meminfo("MemTotal: 7000000 kB\nMemAvailable: 2662400 kB\n") == 2600
+
+
+def test_parse_meminfo_counts_free_swap():
+    text = "MemAvailable: 2097152 kB\nSwapFree: 10485760 kB\n"
+    assert parse_meminfo(text) == 2048 + 10240
 
 
 def test_parse_meminfo_returns_none_without_available_memory():

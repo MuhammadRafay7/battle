@@ -33,16 +33,21 @@ def _bracket(args: argparse.Namespace) -> Bracket:
     return dataclasses.replace(PRESETS[args.size], **overrides)
 
 
-def _describe(bracket: Bracket) -> None:
+def _require_valid_at_once(args: argparse.Namespace) -> None:
+    if args.at_once is not None and args.at_once < 1:
+        raise ValueError("--at-once must be at least 1.")
+
+
+def _describe(bracket: Bracket, requested: int | None) -> None:
     free_mb = free_memory_mb()
-    at_once = fighters_at_once(bracket.fighters, free_mb)
-    ram = "unknown" if free_mb is None else f"{free_mb} MB"
+    at_once = requested or fighters_at_once(bracket.total_fighters, free_mb)
+    memory = "unknown" if free_mb is None else f"{free_mb} MB"
     print(
         f"Size: {bracket.groups} groups of {bracket.fighters} "
         f"({bracket.total_fighters} fighters)"
     )
     print(f"Rounds: {bracket.rounds} per group, {bracket.final_rounds} in the final")
-    print(f"Free RAM: {ram}, so up to {at_once} fighters run at once")
+    print(f"Free memory with swap: {memory}, so up to {at_once} agents run at once")
     print(f"Agent runs: about {bracket.estimated_runs()}, all from your plan's allowance")
 
 
@@ -97,7 +102,8 @@ def _start(store: RunStore) -> int:
         settings["allow_bash"],
         settings.get("web", False),
     )
-    limit = fighters_at_once(settings["fighters"], free_memory_mb())
+    fighters = settings["groups"] * settings["fighters"]
+    limit = settings.get("at_once") or fighters_at_once(fighters, free_memory_mb())
     log = functools.partial(print, flush=True)
     with store.lock():
         store.set_status("running")
@@ -123,7 +129,8 @@ def _start(store: RunStore) -> int:
 
 
 def _plan(args: argparse.Namespace) -> int:
-    _describe(_bracket(args))
+    _require_valid_at_once(args)
+    _describe(_bracket(args), args.at_once)
     return 0
 
 
@@ -133,6 +140,7 @@ def _run(args: argparse.Namespace) -> int:
     if not project.is_dir():
         raise ValueError(f"{project} is not a folder.")
     bracket = _bracket(args)
+    _require_valid_at_once(args)
     specs = args.agent or ["claude"]
     _build_agents(specs, args.model, args.allow_bash, not args.no_web)
     settings = {
@@ -141,11 +149,12 @@ def _run(args: argparse.Namespace) -> int:
         "model": args.model,
         "allow_bash": args.allow_bash,
         "web": not args.no_web,
+        "at_once": args.at_once,
         "apply": not args.no_apply,
         "keep": args.keep,
         "timeout": args.timeout,
     }
-    _describe(bracket)
+    _describe(bracket, args.at_once)
     return _start(RunStore.create(task, project, settings))
 
 
@@ -197,6 +206,7 @@ def _add_size_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fighters", type=int, help="fighters in each group")
     parser.add_argument("--rounds", type=int, help="rounds in each group")
     parser.add_argument("--final-rounds", type=int)
+    parser.add_argument("--at-once", type=int, help="most agents to run at the same time")
 
 
 def _parser() -> argparse.ArgumentParser:

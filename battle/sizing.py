@@ -57,21 +57,25 @@ class Bracket:
 
 
 PRESETS = {
-    "default": Bracket(groups=2, fighters=4),
+    "default": Bracket(groups=3, fighters=4),
     "big": Bracket(groups=4, fighters=5),
 }
 
 
-def fighters_at_once(group_size: int, free_mb: int | None) -> int:
+def fighters_at_once(fighters: int, free_mb: int | None) -> int:
     if free_mb is None:
-        return group_size
+        return fighters
     room = (free_mb - RESERVED_MB) // AGENT_MB
-    return max(1, min(group_size, room))
+    return max(1, min(fighters, room))
 
 
 def parse_meminfo(text: str) -> int | None:
-    match = re.search(r"^MemAvailable:\s+(\d+)\s+kB", text, re.MULTILINE)
-    return int(match.group(1)) // 1024 if match else None
+    available = re.search(r"^MemAvailable:\s+(\d+)\s+kB", text, re.MULTILINE)
+    if available is None:
+        return None
+    swap = re.search(r"^SwapFree:\s+(\d+)\s+kB", text, re.MULTILINE)
+    kilobytes = int(available.group(1)) + (int(swap.group(1)) if swap else 0)
+    return kilobytes // 1024
 
 
 def parse_vm_stat(text: str) -> int | None:

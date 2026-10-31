@@ -37,9 +37,10 @@ $ARGUMENTS
 
 | Flag | Meaning |
 |---|---|
-| `--size big` | 4 groups of 5, about 80 agent runs. The default is 2 groups of 4, about 38 runs |
+| `--size big` | 4 groups of 5, about 80 agent runs. The default is 3 groups of 4, about 53 runs |
 | `--groups N`, `--fighters N` | Custom size |
 | `--rounds N`, `--final-rounds N` | Rounds per group, rounds in the final |
+| `--at-once N` | Most agents running at the same time. All of them start together unless memory is short |
 | `--agent codex` | Use Codex. Repeat `--agent` to mix agents, for example `--agent claude --agent codex` |
 | `--model NAME` | Model for every agent |
 | `--allow-bash` | Lets Claude fighters run shell commands. Only pass it if the user asks, because commands are not sandboxed |

@@ -514,6 +514,67 @@ def test_fighters_at_once_is_respected(project):
     assert agent.peak == 2
 
 
+def test_the_limit_is_shared_across_all_groups(project):
+    agent = CountingAgent()
+    _, fight = battle(project, agent, limit=4, groups=3, fighters=3)
+
+    fight.run()
+
+    assert agent.peak == 4
+
+
+class MeetingAgent(FakeAgent):
+    def __init__(self, parties):
+        super().__init__()
+        self.barrier = threading.Barrier(parties, timeout=10)
+
+    def _fighter(self, job):
+        if "Do the task completely" in job.prompt:
+            self.barrier.wait()
+        return super()._fighter(job)
+
+
+def test_every_fighter_in_every_group_starts_at_the_same_time(project):
+    agent = MeetingAgent(parties=9)
+    store, fight = battle(project, agent, limit=9, groups=3, fighters=3)
+
+    fight.run()
+
+    assert store.status == "done"
+    assert not agent.barrier.broken
+
+
+def test_a_usage_limit_in_one_group_stops_every_group(project):
+    agent = FakeAgent(limit_after=8)
+    _, fight = battle(project, agent, limit=9, groups=3, fighters=3)
+
+    with pytest.raises(UsageLimitReached):
+        fight.run()
+
+    assert len(agent.jobs) <= 8 + 9
+
+
+def test_a_battle_stopped_by_a_limit_in_parallel_groups_can_resume(project):
+    store, fight = battle(project, FakeAgent(limit_after=8), limit=9, groups=3, fighters=3)
+    with pytest.raises(UsageLimitReached):
+        fight.run()
+
+    second = FakeAgent(champion="C3")
+    Fight(RunStore.open(store.id), [second], limit=9, log=lambda message: None).run()
+
+    assert (project / "work_C3.txt").read_text().count("work by C3") == 3
+
+
+def test_the_log_shows_each_fighter_start_and_finish(project):
+    store, fight = battle(project, FakeAgent())
+
+    fight.run()
+
+    log = (store.root / "log.txt").read_text()
+    assert "A1 (group-A round 1) started." in log
+    assert "A1 (group-A round 1) finished: 1 files changed, 0 attacks." in log
+
+
 def test_secrets_never_reach_a_fighter(project):
     (project / ".env").write_text("API_KEY=secret")
     agent = FakeAgent()

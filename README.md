@@ -5,7 +5,7 @@ Give one task to many AI agents. They fight in groups, attacking each other's wo
 ```text
 Your prompt
   -> Setup: reads free RAM, gives each group a different direction
-  -> Group fights: one group at a time, every fighter attacks every other
+  -> Group fights: all groups at once, every fighter attacks every other in its group
   -> Group judges: pick a winner in each group
   -> Head judge: checks each verdict, can overturn it or add a runner-up
   -> Final: group winners fight each other
@@ -51,7 +51,7 @@ battle apply                            # apply a champion kept out with --no-ap
 
 | Size | Groups | Fighters | Agent runs |
 |---|---|---|---|
-| `--size default` | 2 groups of 4 | 8 | about 38 |
+| `--size default` | 3 groups of 4 | 12 | about 53 |
 | `--size big` | 4 groups of 5 | 20 | about 80 |
 
 Rounds end early when no fighter can land an attack with evidence. Change the size with `--groups`, `--fighters`, `--rounds` and `--final-rounds`.
@@ -74,10 +74,10 @@ The rules are about how to work, not about what is currently true. Anything that
 
 ## Limits
 
-- **RAM:** Battle allows 500 MB per agent and keeps 512 MB free. If RAM is short, fighters in a group take turns. Free RAM is only read automatically on Linux and macOS.
+- **Memory:** all groups and fighters start at the same time. Battle allows 500 MB per agent, keeps 512 MB free, and counts free swap as well as free RAM. If that isn't enough, agents wait for a free slot. Running mostly on swap can make your computer slow, so lower it with `--at-once N`. Free memory is only read automatically on Linux and macOS.
 - **Plan usage:** every run comes from your plan's allowance, so a big battle can hit a usage limit. Battle saves after every agent run and exits with code 75, and `battle resume` continues after the limit resets. Finished work isn't redone.
-- **Time:** a 20-run battle on Haiku with 2 fighters at once took about 16 minutes. Bigger sizes and stronger models take longer, so run big battles in the background.
-- **Fighters only see rivals between rounds.** They get each rival's latest finished round, not live edits.
+- **Time:** bigger sizes and stronger models take longer, so run big battles in the background. Watch `log.txt` to see each fighter start and finish.
+- **Fighters only see rivals between rounds.** They get each rival's latest finished round, not live edits. Groups can't see each other until the final.
 - **Internet:** fighters and judges can search the web and read pages, so they can check official docs, best practices and known vulnerabilities. This uses more of your allowance and takes longer. Turn it off with `--no-web`.
 - **Judges read code but never run it.** By default Claude fighters can't run code either, so nobody executes the tests. Pass `--allow-bash` if you want fighters to run them.
 
