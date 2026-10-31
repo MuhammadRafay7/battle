@@ -1,0 +1,23 @@
+[project]
+name = "battle"
+version = "0.1.0"
+description = "Run a tournament where AI agents fight over one task and only the champion's work is kept."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+battle = "battle.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["battle"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
