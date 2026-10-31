@@ -67,6 +67,28 @@ def test_latest_run_is_none_without_runs(home):
     assert latest_run() is None
 
 
+def test_engine_running_follows_the_lock(home, tmp_path):
+    store = new_run(tmp_path)
+    assert store.engine_running() is False
+    with store.lock():
+        assert RunStore.open(store.id).engine_running() is True
+    assert store.engine_running() is False
+
+
+def test_a_run_can_live_inside_a_project(tmp_path, monkeypatch):
+    monkeypatch.delenv("BATTLE_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "user"))
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+
+    store = RunStore.create("task", project, {}, home=project / ".battle")
+
+    assert store.root.parent == project / ".battle" / "runs"
+    assert RunStore.open(store.id).id == store.id
+    assert latest_run() == store.id
+
+
 def test_lock_stops_a_second_process_on_the_same_run(home, tmp_path):
     store = new_run(tmp_path)
     with store.lock():

@@ -334,7 +334,9 @@ class Fight:
         for attempt in range(1, ATTEMPTS + 1):
             materialize(self.baseline, entry, workspace)
             add_rivals(workspace, rivals)
-            job = Job("fighter", prompt, workspace, writes=True, timeout=self.timeout)
+            job = Job(
+                "fighter", prompt, workspace, writes=True, timeout=self.timeout, label=label
+            )
             try:
                 return self._run_agent(fighter.agent, job, label)
             except UsageLimitReached:
@@ -523,6 +525,13 @@ class Fight:
                 return value
         raise BattleError(f"{key} failed twice. {problem}")
 
+    def _halt(self) -> None:
+        self._stop.set()
+        for agent in self.agents:
+            cancel = getattr(agent, "cancel", None)
+            if cancel:
+                cancel()
+
     def _run_agent(self, agent: Agent, job: Job, label: str | None = None) -> str:
         with self._slots:
             if self._stop.is_set():
@@ -544,7 +553,7 @@ class Fight:
             except _Stopped:
                 raise
             except BaseException:
-                self._stop.set()
+                self._halt()
                 raise
 
         with ThreadPoolExecutor(max_workers=max(1, len(listed))) as pool:

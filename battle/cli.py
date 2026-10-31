@@ -3,13 +3,24 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import functools
+import json
+import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
 from battle.agents import DEFAULT_TIMEOUT, Agent, AgentError, UsageLimitReached, make_agent
 from battle.fight import BattleError, Fight, apply_champion, undo_champion
+from battle.host import (
+    HostAgent,
+    claim_jobs,
+    post_failure,
+    post_reply,
+    post_usage_limit,
+    reset_jobs,
+)
 from battle.sizing import PRESETS, Bracket, fighters_at_once, free_memory_mb
 from battle.store import AlreadyRunning, RunNotFound, RunStore, latest_run
 
@@ -17,6 +28,10 @@ EXIT_ERROR = 1
 EXIT_PAUSED = 75
 EXIT_INTERRUPTED = 130
 INSTALLED_AGENTS = ("claude", "codex")
+HOST_AGENT = "host"
+HOST_LIMIT = 20
+ROOT = Path(__file__).resolve().parent.parent
+WAITING_STATUSES = ("prepared", "running")
 
 
 def _fail(message: str) -> int:
@@ -52,9 +67,18 @@ def _describe(bracket: Bracket, requested: int | None) -> None:
 
 
 def _build_agents(
-    specs: list[str], model: str | None, allow_bash: bool, web: bool
+    specs: list[str],
+    model: str | None,
+    allow_bash: bool,
+    web: bool,
+    jobs_dir: Path = Path("jobs"),
 ) -> list[Agent]:
-    agents = [make_agent(spec, model, allow_bash, web) for spec in specs]
+    agents: list[Agent] = [
+        HostAgent(jobs_dir, model=model, web=web)
+        if spec == HOST_AGENT
+        else make_agent(spec, model, allow_bash, web)
+        for spec in specs
+    ]
     for spec in specs:
         if spec in INSTALLED_AGENTS and shutil.which(spec) is None:
             raise ValueError(f"{spec} is not installed or not on PATH.")
@@ -94,6 +118,12 @@ def _show_result(store: RunStore, result: dict[str, Any]) -> None:
     print(f"Report: {store.root / 'report.md'}")
 
 
+def _limit(settings: dict[str, Any]) -> int:
+    fighters = settings["groups"] * settings["fighters"]
+    limit = settings.get("at_once") or fighters_at_once(fighters, free_memory_mb())
+    return min(limit, HOST_LIMIT) if HOST_AGENT in settings["agents"] else limit
+
+
 def _start(store: RunStore) -> int:
     settings = store.settings
     agents = _build_agents(
@@ -101,12 +131,13 @@ def _start(store: RunStore) -> int:
         settings.get("model"),
         settings["allow_bash"],
         settings.get("web", False),
+        store.root / "jobs",
     )
-    fighters = settings["groups"] * settings["fighters"]
-    limit = settings.get("at_once") or fighters_at_once(fighters, free_memory_mb())
+    limit = _limit(settings)
     log = functools.partial(print, flush=True)
     with store.lock():
         store.set_status("running")
+        reset_jobs(store.root / "jobs")
         try:
             result = Fight(store, agents, limit, log).run()
         except UsageLimitReached as error:
@@ -134,6 +165,24 @@ def _plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _require_valid_host(args: argparse.Namespace) -> None:
+    if args.allow_bash:
+        raise ValueError("--allow-bash needs separate agents, so it can't use --agent host.")
+    if args.no_web:
+        raise ValueError("--no-web needs separate agents, so it can't use --agent host.")
+    if not args.prepare:
+        raise ValueError("--agent host needs --prepare, because a Claude Code chat runs its agents.")
+
+
+def _exclude_from_git(project: Path) -> None:
+    exclude = project / ".git" / "info" / "exclude"
+    if not exclude.parent.is_dir():
+        return
+    text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+    if ".battle/" not in text.splitlines():
+        exclude.write_text(text + ".battle/\n", encoding="utf-8")
+
+
 def _run(args: argparse.Namespace) -> int:
     task = _read_task(args)
     project = args.project.resolve()
@@ -142,6 +191,9 @@ def _run(args: argparse.Namespace) -> int:
     bracket = _bracket(args)
     _require_valid_at_once(args)
     specs = args.agent or ["claude"]
+    host = HOST_AGENT in specs
+    if host:
+        _require_valid_host(args)
     _build_agents(specs, args.model, args.allow_bash, not args.no_web)
     settings = {
         **dataclasses.asdict(bracket),
@@ -155,7 +207,16 @@ def _run(args: argparse.Namespace) -> int:
         "timeout": args.timeout,
     }
     _describe(bracket, args.at_once)
-    return _start(RunStore.create(task, project, settings))
+    home = project / ".battle" if host and "BATTLE_HOME" not in os.environ else None
+    store = RunStore.create(task, project, settings, home=home)
+    if not args.prepare:
+        return _start(store)
+    if host:
+        _exclude_from_git(project)
+    store.set_status("prepared")
+    print(f"Run: {store.id}")
+    print(f"Log: {store.root / 'log.txt'}")
+    return 0
 
 
 def _resume(args: argparse.Namespace) -> int:
@@ -200,6 +261,52 @@ def _undo(args: argparse.Namespace) -> int:
     return 0
 
 
+def _jobs(args: argparse.Namespace) -> int:
+    run_id = _open(args).id
+    deadline = time.monotonic() + args.wait_seconds
+    while True:
+        store = RunStore.open(run_id)
+        jobs_dir = store.root / "jobs"
+        jobs = claim_jobs(jobs_dir) if jobs_dir.exists() else []
+        status = store.status
+        if status == "running" and not store.engine_running():
+            status = "stopped"
+        if jobs or status not in WAITING_STATUSES or time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    payload: dict[str, Any] = {"run": run_id, "status": status, "jobs": jobs}
+    if status == "done":
+        payload["report"] = str(store.root / "report.md")
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _reply(args: argparse.Namespace) -> int:
+    jobs_dir = _open(args).root / "jobs"
+    post = post_failure if args.failed else post_usage_limit if args.usage_limit else post_reply
+    post(jobs_dir, args.job, sys.stdin.read())
+    return 0
+
+
+def _install(args: argparse.Namespace) -> int:
+    claude = Path.home() / ".claude"
+    links = {
+        claude / "skills" / "battle": ROOT / "skill",
+        claude / "agents" / "battle-fighter.md": ROOT / "agents" / "battle-fighter.md",
+        claude / "agents" / "battle-judge.md": ROOT / "agents" / "battle-judge.md",
+    }
+    taken = [str(link) for link in links if link.exists() and not link.is_symlink()]
+    if taken:
+        raise ValueError("Refusing to replace: " + ", ".join(taken))
+    for link, target in links.items():
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink():
+            link.unlink()
+        link.symlink_to(target)
+    print("Installed /battle and its agents. Open a new Claude Code session to use them.")
+    return 0
+
+
 def _add_size_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--size", choices=sorted(PRESETS), default="default")
     parser.add_argument("--groups", type=int)
@@ -228,7 +335,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--agent",
         action="append",
-        help="claude, codex or command:<cmd>. Repeat it to mix agents",
+        help="claude, codex, host or command:<cmd>. Repeat it to mix agents",
     )
     run.add_argument("--model")
     run.add_argument(
@@ -238,6 +345,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--no-web", action="store_true", help="turn off web search and page fetching")
     run.add_argument("--no-apply", action="store_true", help="keep the champion out of the project")
+    run.add_argument("--prepare", action="store_true", help="create the battle without starting it")
     run.add_argument("--keep", action="store_true", help="keep every entry after the battle")
     run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds per agent run")
     run.set_defaults(handler=_run)
@@ -250,6 +358,21 @@ def _parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name, help=description)
         command.add_argument("id", nargs="?", help="battle id, or the latest one if left out")
         command.set_defaults(handler=handler)
+
+    jobs = commands.add_parser("jobs", help="hand waiting jobs to the chat as JSON")
+    jobs.add_argument("id", nargs="?", help="battle id, or the latest one if left out")
+    jobs.add_argument("--wait-seconds", type=float, default=100, help="how long to wait for a job")
+    jobs.set_defaults(handler=_jobs)
+
+    reply = commands.add_parser("reply", help="send a subagent's final message from stdin")
+    reply.add_argument("job")
+    reply.add_argument("id", nargs="?", help="battle id, or the latest one if left out")
+    reply.add_argument("--failed", action="store_true", help="the subagent failed")
+    reply.add_argument("--usage-limit", action="store_true", help="the plan's limit was reached")
+    reply.set_defaults(handler=_reply)
+
+    install = commands.add_parser("install", help="link /battle and its agents into ~/.claude")
+    install.set_defaults(handler=_install)
 
     apply = commands.add_parser("apply", help="apply the champion's work to the project")
     apply.add_argument("id", nargs="?", help="battle id, or the latest one if left out")

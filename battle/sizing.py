@@ -57,7 +57,7 @@ class Bracket:
 
 
 PRESETS = {
-    "default": Bracket(groups=3, fighters=4),
+    "default": Bracket(groups=2, fighters=4),
     "big": Bracket(groups=4, fighters=5),
 }
 

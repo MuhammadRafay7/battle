@@ -23,6 +23,9 @@ def battle_home() -> Path:
 
 
 def _runs_folder() -> Path:
+    local = Path.cwd() / ".battle" / "runs"
+    if "BATTLE_HOME" not in os.environ and local.is_dir():
+        return local
     return battle_home() / "runs"
 
 
@@ -41,10 +44,12 @@ class RunStore:
         self._guard = threading.Lock()
 
     @classmethod
-    def create(cls, task: str, project: Path, settings: dict[str, Any]) -> "RunStore":
+    def create(
+        cls, task: str, project: Path, settings: dict[str, Any], home: Path | None = None
+    ) -> "RunStore":
         now = datetime.datetime.now(datetime.timezone.utc)
         run_id = now.strftime("%Y%m%d-%H%M%S-%f")
-        root = _runs_folder() / run_id
+        root = (home / "runs" if home else _runs_folder()) / run_id
         root.mkdir(parents=True)
         store = cls(
             root,
@@ -121,6 +126,17 @@ class RunStore:
             except BlockingIOError as error:
                 raise AlreadyRunning(f"Battle {self.id} is already running.") from error
             yield
+
+    def engine_running(self) -> bool:
+        path = self.root / "lock"
+        if not path.exists():
+            return False
+        with path.open("a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            return False
 
     def _save(self) -> None:
         temporary = self.root / "state.json.partial"

@@ -56,6 +56,7 @@ class Job:
     writes: bool
     read_dirs: tuple[Path, ...] = ()
     timeout: float = DEFAULT_TIMEOUT
+    label: str = ""
 
 
 class Agent(Protocol):

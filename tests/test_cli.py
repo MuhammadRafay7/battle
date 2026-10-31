@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import shlex
@@ -53,8 +54,8 @@ def test_plan_lets_every_fighter_run_at_once_when_memory_allows(capsys, monkeypa
     cli.main(["plan"])
 
     output = capsys.readouterr().out
-    assert "3 groups of 4" in output
-    assert "up to 12 agents run at once" in output
+    assert "2 groups of 4" in output
+    assert "up to 8 agents run at once" in output
 
 
 def test_plan_caps_agents_when_memory_is_short(capsys, monkeypatch):
@@ -271,4 +272,161 @@ def test_launcher_works_through_a_symlink_from_any_folder(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "3 groups of 4" in result.stdout
+    assert "2 groups of 4" in result.stdout
+
+
+HOST = ["--agent", "host"]
+
+
+@pytest.fixture
+def in_project(project, monkeypatch):
+    monkeypatch.delenv("BATTLE_HOME", raising=False)
+    monkeypatch.chdir(project)
+    return project
+
+
+def prepare(project, *extra):
+    return cli.main(["run", "add a feature", "--project", str(project), "--prepare"] + HOST + list(extra))
+
+
+def test_prepare_creates_a_host_run_inside_the_project_without_starting(in_project, capsys):
+    assert prepare(in_project) == 0
+
+    output = capsys.readouterr().out
+    run_id = latest_run()
+    assert f"Run: {run_id}" in output
+    store = RunStore.open(run_id)
+    assert store.root.parent == in_project / ".battle" / "runs"
+    assert store.status == "prepared"
+
+
+def test_prepare_keeps_the_battle_folder_out_of_git(in_project, capsys):
+    subprocess.run(["git", "init", "-q"], cwd=in_project, check=True)
+
+    prepare(in_project)
+    prepare(in_project)
+
+    exclude = (in_project / ".git" / "info" / "exclude").read_text()
+    assert exclude.count(".battle/") == 1
+    assert ".battle" not in subprocess.run(
+        ["git", "status", "--porcelain"], cwd=in_project, capture_output=True, text=True
+    ).stdout
+
+
+def test_host_refuses_shell_access(in_project, capsys):
+    assert prepare(in_project, "--allow-bash") == 1
+    assert "--allow-bash" in capsys.readouterr().err
+
+
+def test_host_refuses_no_web(in_project, capsys):
+    assert prepare(in_project, "--no-web") == 1
+    assert "--no-web" in capsys.readouterr().err
+
+
+def test_host_refuses_to_run_without_a_chat_in_a_plain_run(in_project, capsys):
+    code = cli.main(["run", "x", "--project", str(in_project)] + HOST)
+    assert code == 1
+    assert "--prepare" in capsys.readouterr().err
+
+
+def test_host_never_asks_for_more_than_twenty_at_once(in_project, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "free_memory_mb", lambda: 64_000)
+    prepare(in_project, "--groups", "5", "--fighters", "5")
+    store = RunStore.open(latest_run())
+    assert cli._limit(store.settings) == 20
+
+
+def test_jobs_reports_a_prepared_run_and_no_jobs(in_project, capsys):
+    prepare(in_project)
+    run_id = latest_run()
+    capsys.readouterr()
+
+    assert cli.main(["jobs", run_id, "--wait-seconds", "0"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"run": run_id, "status": "prepared", "jobs": []}
+
+
+def test_jobs_notices_a_dead_engine(in_project, capsys):
+    prepare(in_project)
+    store = RunStore.open(latest_run())
+    store.set_status("running")
+    capsys.readouterr()
+
+    cli.main(["jobs", store.id, "--wait-seconds", "0"])
+
+    assert json.loads(capsys.readouterr().out)["status"] == "stopped"
+
+
+def test_jobs_returns_finished_status_with_the_report(project, capsys):
+    run_battle(project)
+    capsys.readouterr()
+
+    cli.main(["jobs", "--wait-seconds", "0"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "done"
+    assert payload["report"].endswith("report.md")
+
+
+def test_reply_refuses_an_unknown_job(in_project, capsys, monkeypatch):
+    prepare(in_project)
+    capsys.readouterr()
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("text"))
+
+    assert cli.main(["reply", "0042"]) == 1
+    assert "0042" in capsys.readouterr().err
+
+
+def test_install_links_the_skill_and_both_agents(tmp_path, capsys, monkeypatch):
+    home = tmp_path / "user"
+    monkeypatch.setenv("HOME", str(home))
+
+    assert cli.main(["install"]) == 0
+
+    assert (home / ".claude" / "skills" / "battle" / "SKILL.md").exists()
+    assert (home / ".claude" / "agents" / "battle-fighter.md").is_symlink()
+    assert (home / ".claude" / "agents" / "battle-judge.md").is_symlink()
+
+
+def test_install_can_run_twice(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "user"))
+    cli.main(["install"])
+    assert cli.main(["install"]) == 0
+
+
+def test_install_refuses_to_replace_a_file_you_wrote(tmp_path, capsys, monkeypatch):
+    home = tmp_path / "user"
+    monkeypatch.setenv("HOME", str(home))
+    custom = home / ".claude" / "agents" / "battle-judge.md"
+    custom.parent.mkdir(parents=True)
+    custom.write_text("mine")
+
+    assert cli.main(["install"]) == 1
+
+    assert custom.read_text() == "mine"
+    assert "battle-judge.md" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "name, role, tools",
+    [
+        ("battle-fighter", "fighter", "Read, Edit, Write, Grep, Glob, WebSearch, WebFetch"),
+        ("battle-judge", "judge", "Read, Grep, Glob, WebSearch, WebFetch"),
+    ],
+)
+def test_agent_definitions_keep_their_tools_and_guard(name, role, tools):
+    text = (ROOT / "agents" / f"{name}.md").read_text()
+    assert f"tools: {tools}" in text
+    assert f'battle-guard\\" {role}"' in text
+    assert "Bash" not in text.split("---")[1].split("hooks:")[0]
+
+
+def test_skill_carries_on_after_asking_for_a_missing_task():
+    skill = (ROOT / "skill" / "SKILL.md").read_text()
+    assert "continue from step 2" in skill
+
+
+def test_skill_forbids_the_chat_from_doing_the_task_itself():
+    skill = (ROOT / "skill" / "SKILL.md").read_text()
+    assert "Never do the task yourself" in skill

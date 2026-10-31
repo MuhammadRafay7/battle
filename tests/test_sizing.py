@@ -12,12 +12,12 @@ from battle.sizing import (
 
 
 def test_presets_match_the_two_tournament_sizes():
-    assert PRESETS["default"] == Bracket(groups=3, fighters=4)
+    assert PRESETS["default"] == Bracket(groups=2, fighters=4)
     assert PRESETS["big"] == Bracket(groups=4, fighters=5)
 
 
 def test_estimated_runs_counts_every_agent_in_the_tournament():
-    assert PRESETS["default"].estimated_runs() == 53
+    assert PRESETS["default"].estimated_runs() == 38
     assert PRESETS["big"].estimated_runs() == 80
 
 

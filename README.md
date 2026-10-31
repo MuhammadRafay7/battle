@@ -22,18 +22,15 @@ There is nothing to install. Run `bin/battle`, or link it onto your PATH.
 
 ## Use it from Claude Code
 
-Link the `skill` folder into a skills folder, then type `/battle add a login page`.
+Install it once, then open a new Claude Code session:
 
 ```bash
-# For all your projects
-ln -s /path/to/battle/skill ~/.claude/skills/battle
-
-# For one folder of projects
-mkdir -p /path/to/projects/.claude/skills
-ln -s /path/to/battle/skill /path/to/projects/.claude/skills/battle
+bin/battle install
 ```
 
-The one-folder link doesn't reach projects that are their own git repositories, because Claude Code stops looking for skills at the repository root. Those need the all-projects link.
+This links the `/battle` skill and two agent definitions into `~/.claude`. Then type `/battle add a login page`. Put the task in the same message as `/battle`.
+
+Claude agents run as real subagents of that chat, so you see them there. The chat has to stay open for the whole battle, and managing the agents uses some of your allowance too. Agent files are read from `~/.claude/agents` because hooks in a project's own agent files are skipped in folders you haven't trusted, and those hooks are what keep fighters in their own folders.
 
 ## Use it from a terminal
 
@@ -51,7 +48,7 @@ battle apply                            # apply a champion kept out with --no-ap
 
 | Size | Groups | Fighters | Agent runs |
 |---|---|---|---|
-| `--size default` | 3 groups of 4 | 12 | about 53 |
+| `--size default` | 2 groups of 4 | 8 | about 38 |
 | `--size big` | 4 groups of 5 | 20 | about 80 |
 
 Rounds end early when no fighter can land an attack with evidence. Change the size with `--groups`, `--fighters`, `--rounds` and `--final-rounds`.
@@ -60,7 +57,8 @@ Rounds end early when no fighter can land an attack with evidence. Change the si
 
 | Agent | Flag |
 |---|---|
-| Claude Code | `--agent claude` (default) |
+| Claude Code | `--agent claude` (default in a terminal) |
+| Claude Code subagents | `--agent host` (default for `/battle`) |
 | Codex | `--agent codex` |
 | Any other CLI | `--agent "command:my-tool --flag"` |
 
@@ -89,6 +87,8 @@ The rules are about how to work, not about what is currently true. Anything that
 - `battle undo` restores the project from a backup taken just before the champion was applied.
 - Judges can't change files. Claude fighters get no shell unless you pass `--allow-bash`, and those commands are **not sandboxed**, because a copy of your project doesn't stop a command from reaching the rest of your computer. Codex fighters run shell commands inside Codex's own sandbox.
 - Claude agents don't load your MCP servers, so they can't reach your browser, memory or connected apps.
+- Subagents share the chat's folder, so a guard hook (`bin/battle-guard`) keeps them apart. A fighter can only read and write its own copy, and a judge can only read the battle's folder. In a real test, a fighter told to write into the project and a rival's copy was blocked. If a hook can't run at all, nothing else stops a fighter, so keep the install in `~/.claude`.
+- `--allow-bash` and `--no-web` don't work with subagents, because the guard can't check shell commands and subagents always have web tools. `/battle` runs separate agents for those.
 - Web access is on by default, and it adds a real risk. A web page, or a rival's text, could try to trick an agent into sending your code to a website. Prompts forbid this, but that can't guarantee it, and secrets are protected only because they aren't copied. Use `--no-web` for code that must stay private.
 - Rivals write the text that judges read, so every prompt tells agents to treat that text as data, not instructions. That lowers the risk of an entry manipulating a judge but doesn't remove it. Read the champion's diff before you ship it.
 
