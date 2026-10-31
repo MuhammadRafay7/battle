@@ -63,15 +63,16 @@ def test_claude_fighter_can_edit_but_gets_no_shell_by_default(tmp_path):
 
     assert argv[:2] == ["claude", "-p"]
     assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
-    assert argv[argv.index("--tools") + 1] == "Read,Edit,Write,Grep,Glob"
+    assert argv[argv.index("--tools") + 1] == "Read,Edit,Write,Grep,Glob,WebSearch,WebFetch"
     assert "--dangerously-skip-permissions" not in argv
 
 
 def test_claude_fighter_gets_a_shell_only_when_allowed(tmp_path):
     argv = ClaudeAgent(allow_bash=True).command(job(tmp_path))
 
-    assert argv[argv.index("--tools") + 1] == "Read,Edit,Write,Grep,Glob,Bash"
-    assert argv[argv.index("--allowedTools") + 1] == "Read,Edit,Write,Grep,Glob,Bash"
+    tools = "Read,Edit,Write,Grep,Glob,Bash,WebSearch,WebFetch"
+    assert argv[argv.index("--tools") + 1] == tools
+    assert argv[argv.index("--allowedTools") + 1] == tools
 
 
 def test_claude_judge_is_read_only_even_with_shell_allowed(tmp_path):
@@ -79,9 +80,26 @@ def test_claude_judge_is_read_only_even_with_shell_allowed(tmp_path):
         job(tmp_path, role="judge", writes=False, read_dirs=(tmp_path / "baseline",))
     )
 
-    assert argv[argv.index("--tools") + 1] == "Read,Grep,Glob"
+    assert argv[argv.index("--tools") + 1] == "Read,Grep,Glob,WebSearch,WebFetch"
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
     assert argv[argv.index("--add-dir") + 1] == str(tmp_path / "baseline")
+
+
+@pytest.mark.parametrize(
+    "writes, tools", [(True, "Read,Edit,Write,Grep,Glob"), (False, "Read,Grep,Glob")]
+)
+def test_claude_agents_lose_web_tools_when_web_is_off(tmp_path, writes, tools):
+    argv = ClaudeAgent(web=False).command(job(tmp_path, writes=writes))
+
+    assert argv[argv.index("--tools") + 1] == tools
+    assert argv[argv.index("--allowedTools") + 1] == tools
+
+
+@pytest.mark.parametrize("writes", [True, False])
+def test_claude_agents_never_load_your_mcp_servers(tmp_path, writes):
+    argv = ClaudeAgent().command(job(tmp_path, writes=writes))
+    assert "--strict-mcp-config" in argv
+    assert "--mcp-config" not in argv
 
 
 def test_claude_passes_the_chosen_model(tmp_path):
@@ -175,6 +193,20 @@ def test_codex_judge_is_read_only(tmp_path):
     assert argv[argv.index("--sandbox") + 1] == "read-only"
 
 
+@pytest.mark.parametrize("writes", [True, False])
+def test_codex_gets_live_search_while_keeping_its_sandbox(tmp_path, writes):
+    argv = CodexAgent().command(job(tmp_path, writes=writes), tmp_path / "reply.txt")
+
+    assert argv[argv.index("-c") + 1] == 'web_search="live"'
+    assert "--search" not in argv
+    assert "danger-full-access" not in argv
+
+
+def test_codex_search_is_disabled_when_web_is_off(tmp_path):
+    argv = CodexAgent(web=False).command(job(tmp_path), tmp_path / "reply.txt")
+    assert argv[argv.index("-c") + 1] == 'web_search="disabled"'
+
+
 def test_codex_returns_its_last_message(tmp_path):
     binary = script(
         tmp_path / "codex",
@@ -193,6 +225,20 @@ def test_command_agent_gets_the_prompt_and_role(tmp_path):
         script(tmp_path / "tool", 'printf "%s:" "$BATTLE_ROLE"\ncat\n')
     )
     assert agent.run(job(tmp_path, prompt="hello")) == "fighter:hello"
+
+
+@pytest.mark.parametrize("web, expected", [(True, "1"), (False, "0")])
+def test_command_agent_is_told_whether_web_is_on(tmp_path, web, expected):
+    agent = CommandAgent(
+        script(tmp_path / "tool", 'cat > /dev/null\nprintf "%s" "$BATTLE_WEB"\n'), web=web
+    )
+    assert agent.run(job(tmp_path)) == expected
+
+
+@pytest.mark.parametrize("spec", ["claude", "codex", "command:tool"])
+def test_make_agent_passes_the_web_choice_on(spec):
+    assert make_agent(spec, web=False).web is False
+    assert make_agent(spec).web is True
 
 
 def test_make_agent_picks_the_right_adapter(tmp_path):

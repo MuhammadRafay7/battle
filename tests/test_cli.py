@@ -66,6 +66,16 @@ def test_run_finishes_a_real_battle_through_subprocess_agents(project, capsys):
     assert (RunStore.open(latest_run()).root / "report.md").exists()
 
 
+def test_web_is_on_by_default(project, capsys):
+    run_battle(project)
+    assert RunStore.open(latest_run()).settings["web"] is True
+
+
+def test_no_web_turns_it_off(project, capsys):
+    run_battle(project, "--no-web")
+    assert RunStore.open(latest_run()).settings["web"] is False
+
+
 def test_run_reads_the_task_from_a_file(tmp_path, project, capsys):
     task_file = tmp_path / "task.txt"
     task_file.write_text("task with `quotes` and $(danger)\n")

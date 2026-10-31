@@ -37,6 +37,7 @@ SESSION_VARIABLES = frozenset(
 )
 FIGHTER_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob")
 JUDGE_TOOLS = ("Read", "Grep", "Glob")
+WEB_TOOLS = ("WebSearch", "WebFetch")
 
 
 class AgentError(Exception):
@@ -127,18 +128,21 @@ def _check(name: str, failed: bool, message: str) -> None:
 class ClaudeAgent:
     model: str | None = None
     allow_bash: bool = False
+    web: bool = True
     binary: str = "claude"
     name: str = "claude"
 
     def command(self, job: Job) -> list[str]:
         shell = ("Bash",) if self.allow_bash else ()
-        tools = ",".join((*FIGHTER_TOOLS, *shell) if job.writes else JUDGE_TOOLS)
+        web = WEB_TOOLS if self.web else ()
+        tools = ",".join((*FIGHTER_TOOLS, *shell, *web) if job.writes else (*JUDGE_TOOLS, *web))
         argv = [
             self.binary,
             "-p",
             "--output-format",
             "json",
             "--no-session-persistence",
+            "--strict-mcp-config",
             "--permission-mode",
             "acceptEdits" if job.writes else "dontAsk",
             "--tools",
@@ -170,6 +174,7 @@ class ClaudeAgent:
 @dataclass(frozen=True)
 class CodexAgent:
     model: str | None = None
+    web: bool = True
     binary: str = "codex"
     name: str = "codex"
 
@@ -181,6 +186,8 @@ class CodexAgent:
             "--ephemeral",
             "--sandbox",
             "workspace-write" if job.writes else "read-only",
+            "-c",
+            f'web_search="{"live" if self.web else "disabled"}"',
             "-C",
             str(job.cwd),
             "-o",
@@ -202,21 +209,26 @@ class CodexAgent:
 @dataclass(frozen=True)
 class CommandAgent:
     command_line: str
+    web: bool = True
     name: str = "command"
 
     def run(self, job: Job) -> str:
         code, stdout, stderr = _execute(
-            shlex.split(self.command_line), job, {"BATTLE_ROLE": job.role}
+            shlex.split(self.command_line),
+            job,
+            {"BATTLE_ROLE": job.role, "BATTLE_WEB": "1" if self.web else "0"},
         )
         _check(self.name, code != 0, stdout if code == 0 else stderr or stdout)
         return stdout
 
 
-def make_agent(spec: str, model: str | None = None, allow_bash: bool = False) -> Agent:
+def make_agent(
+    spec: str, model: str | None = None, allow_bash: bool = False, web: bool = True
+) -> Agent:
     if spec == "claude":
-        return ClaudeAgent(model=model, allow_bash=allow_bash)
+        return ClaudeAgent(model=model, allow_bash=allow_bash, web=web)
     if spec == "codex":
-        return CodexAgent(model=model)
+        return CodexAgent(model=model, web=web)
     if spec.startswith("command:"):
-        return CommandAgent(spec.removeprefix("command:"))
+        return CommandAgent(spec.removeprefix("command:"), web=web)
     raise ValueError(f"Unknown agent: {spec}. Use claude, codex or command:<your command>.")

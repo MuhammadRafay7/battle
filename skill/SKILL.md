@@ -43,6 +43,7 @@ $ARGUMENTS
 | `--agent codex` | Use Codex. Repeat `--agent` to mix agents, for example `--agent claude --agent codex` |
 | `--model NAME` | Model for every agent |
 | `--allow-bash` | Lets Claude fighters run shell commands. Only pass it if the user asks, because commands are not sandboxed |
+| `--no-web` | Turn off web search and page fetching, which are on by default. Pass it if the user says the code must stay private |
 | `--no-apply` | Keep the champion out of the project until `battle apply` |
 
 ## Example

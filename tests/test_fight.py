@@ -1,10 +1,14 @@
+import re
 import threading
 import time
+import tomllib
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 
+from battle import prompts
 from battle.agents import UsageLimitReached
 from battle.fight import BattleError, Fight, apply_champion
 from battle.sizing import Bracket
@@ -65,6 +69,111 @@ def test_full_battle_applies_only_the_champion(project):
     assert not (project / "work_A3.txt").exists()
     assert not (project / "work_A1.txt").exists()
     assert store.status == "done"
+
+
+def test_web_research_reaches_every_agent_and_judge_when_web_is_on(project):
+    agent = FakeAgent()
+    _, fight = battle(project, agent, web=True)
+
+    fight.run()
+
+    assert {job.role for job in agent.jobs} == {
+        "director",
+        "fighter",
+        "group-judge",
+        "head-check",
+        "specialist",
+        "head-champion",
+    }
+    assert all(job.prompt.startswith(prompts.WEB_RESEARCH) for job in agent.jobs)
+
+
+def test_no_agent_is_told_about_the_web_when_it_is_off(project):
+    agent = FakeAgent()
+    _, fight = battle(project, agent, web=False)
+
+    fight.run()
+
+    assert not any(prompts.WEB_RESEARCH in job.prompt for job in agent.jobs)
+
+
+def test_rulebook_has_ten_numbered_rules():
+    assert len(re.findall(r"^\d+\. ", prompts.RULEBOOK, re.MULTILINE)) == 10
+
+
+def test_every_agent_and_judge_gets_the_rulebook(project):
+    agent = FakeAgent()
+    _, fight = battle(project, agent, web=True)
+
+    fight.run()
+
+    assert all(prompts.RULEBOOK in job.prompt for job in agent.jobs)
+
+
+def test_rulebook_ships_with_the_package():
+    config = tomllib.loads(Path("pyproject.toml").read_text())
+    assert "rules.md" in config["tool"]["setuptools"]["package-data"]["battle"]
+
+
+@pytest.mark.parametrize("role", ["group-judge", "specialist"])
+def test_scoring_judges_penalize_broken_rules(project, role):
+    agent = FakeAgent()
+    _, fight = battle(project, agent)
+
+    fight.run()
+
+    assert all("breaks the rulebook" in prompt for prompt in prompts_for(agent, role))
+
+
+def test_head_judge_overturns_verdicts_that_ignored_the_rulebook(project):
+    agent = FakeAgent()
+    _, fight = battle(project, agent)
+
+    fight.run()
+
+    assert "ignored the rulebook" in prompts_for(agent, "head-check")[0]
+
+
+def test_head_judge_refuses_fake_work_as_champion(project):
+    agent = FakeAgent()
+    _, fight = battle(project, agent)
+
+    fight.run()
+
+    assert "fake work" in prompts_for(agent, "head-champion")[0]
+
+
+def test_fighters_can_attack_a_broken_rule(project):
+    agent = FakeAgent()
+    _, fight = battle(project, agent)
+
+    fight.run()
+
+    assert "broken rule" in fighter_prompts(agent, "A1")[1]
+
+
+def test_without_web_agents_say_what_they_could_not_check(project):
+    agent = FakeAgent()
+    _, fight = battle(project, agent, web=False)
+
+    fight.run()
+
+    assert all(prompts.NO_WEB in job.prompt for job in agent.jobs)
+
+
+def test_with_web_agents_are_not_told_they_have_none(project):
+    agent = FakeAgent()
+    _, fight = battle(project, agent, web=True)
+
+    fight.run()
+
+    assert not any(prompts.NO_WEB in job.prompt for job in agent.jobs)
+
+
+def test_web_prompt_treats_pages_as_data_and_protects_your_code():
+    note = prompts.WEB_RESEARCH.lower()
+    assert "never instructions" in note
+    assert "never put this project's code" in note
 
 
 def test_full_battle_makes_exactly_the_estimated_runs(project):

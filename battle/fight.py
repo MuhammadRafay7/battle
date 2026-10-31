@@ -103,6 +103,8 @@ class Fight:
         )
         self.timeout = settings.get("timeout", DEFAULT_TIMEOUT)
         self.baseline = store.root / "baseline"
+        web_access = prompts.WEB_RESEARCH if settings.get("web") else prompts.NO_WEB
+        self._preamble = web_access + prompts.RULEBOOK
         self._log = log
 
     def run(self) -> dict[str, Any]:
@@ -137,7 +139,14 @@ class Fight:
         partial.rename(self.baseline)
 
     def _judge_job(self, role: str, prompt: str, cwd: Path) -> Job:
-        return Job(role, prompt, cwd, writes=False, read_dirs=(self.baseline,), timeout=self.timeout)
+        return Job(
+            role,
+            self._preamble + prompt,
+            cwd,
+            writes=False,
+            read_dirs=(self.baseline,),
+            timeout=self.timeout,
+        )
 
     def _choose_directions(self) -> list[dict[str, str]]:
         count = self.bracket.groups
@@ -150,7 +159,7 @@ class Fight:
         self._say("Setup: choosing a different direction for each group.")
         job = Job(
             "director",
-            prompts.directions(self.store.task, count),
+            self._preamble + prompts.directions(self.store.task, count),
             self.baseline,
             writes=False,
             timeout=self.timeout,
@@ -284,7 +293,9 @@ class Fight:
 
         workspace = self.store.root / "workspace" / fighter.id
         try:
-            reply = self._attempt_turn(fighter, prompt, entries.get(fighter.id), rivals, workspace)
+            reply = self._attempt_turn(
+                fighter, self._preamble + prompt, entries.get(fighter.id), rivals, workspace
+            )
             if reply is None:
                 result = {"forfeit": True, "reason": "It failed twice."}
             else:

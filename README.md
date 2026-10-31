@@ -66,12 +66,19 @@ Rounds end early when no fighter can land an attack with evidence. Change the si
 
 Repeat `--agent` to put different agents in the same fight. The first agent does all the judging. A custom command gets the prompt on stdin and prints its reply, and must end the reply with the JSON object the prompt asks for.
 
+## Rules
+
+Every fighter and judge follows the rulebook in [`battle/rules.md`](battle/rules.md). It covers how to build, how to research and how to judge. Fighters can attack a broken rule, and judges penalize one.
+
+The rules are about how to work, not about what is currently true. Anything that changes over time, such as library versions, APIs and security advice, is left for agents to research. Keep it that way if you edit the file, or the rules will go out of date. Edits apply to the next agent that starts.
+
 ## Limits
 
 - **RAM:** Battle allows 500 MB per agent and keeps 512 MB free. If RAM is short, fighters in a group take turns. Free RAM is only read automatically on Linux and macOS.
 - **Plan usage:** every run comes from your plan's allowance, so a big battle can hit a usage limit. Battle saves after every agent run and exits with code 75, and `battle resume` continues after the limit resets. Finished work isn't redone.
 - **Time:** a 20-run battle on Haiku with 2 fighters at once took about 16 minutes. Bigger sizes and stronger models take longer, so run big battles in the background.
 - **Fighters only see rivals between rounds.** They get each rival's latest finished round, not live edits.
+- **Internet:** fighters and judges can search the web and read pages, so they can check official docs, best practices and known vulnerabilities. This uses more of your allowance and takes longer. Turn it off with `--no-web`.
 - **Judges read code but never run it.** By default Claude fighters can't run code either, so nobody executes the tests. Pass `--allow-bash` if you want fighters to run them.
 
 ## Safety
@@ -80,7 +87,9 @@ Repeat `--agent` to put different agents in the same fight. The first agent does
 - Folders like `.git` and `node_modules` are not copied, so fighters can't use them. Neither are secrets such as `.env`, `*.pem` and `*.key`.
 - Applying stops if you edited one of the same files during the battle. `battle apply --force` overwrites them.
 - `battle undo` restores the project from a backup taken just before the champion was applied.
-- Judges are read-only. Claude fighters get no shell unless you pass `--allow-bash`, and those commands are **not sandboxed**, because a copy of your project doesn't stop a command from reaching the rest of your computer. Codex fighters run shell commands inside Codex's own sandbox.
+- Judges can't change files. Claude fighters get no shell unless you pass `--allow-bash`, and those commands are **not sandboxed**, because a copy of your project doesn't stop a command from reaching the rest of your computer. Codex fighters run shell commands inside Codex's own sandbox.
+- Claude agents don't load your MCP servers, so they can't reach your browser, memory or connected apps.
+- Web access is on by default, and it adds a real risk. A web page, or a rival's text, could try to trick an agent into sending your code to a website. Prompts forbid this, but that can't guarantee it, and secrets are protected only because they aren't copied. Use `--no-web` for code that must stay private.
 - Rivals write the text that judges read, so every prompt tells agents to treat that text as data, not instructions. That lowers the risk of an entry manipulating a judge but doesn't remove it. Read the champion's diff before you ship it.
 
 Each battle is stored in `~/.battle/runs/<id>/`, or under `BATTLE_HOME` if you set it, including `report.md`, `log.txt` and the champion's `changes.diff`. It also keeps a copy of your project without the skipped folders and secrets, so delete old runs to free the space.

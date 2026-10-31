@@ -46,8 +46,10 @@ def _describe(bracket: Bracket) -> None:
     print(f"Agent runs: about {bracket.estimated_runs()}, all from your plan's allowance")
 
 
-def _build_agents(specs: list[str], model: str | None, allow_bash: bool) -> list[Agent]:
-    agents = [make_agent(spec, model, allow_bash) for spec in specs]
+def _build_agents(
+    specs: list[str], model: str | None, allow_bash: bool, web: bool
+) -> list[Agent]:
+    agents = [make_agent(spec, model, allow_bash, web) for spec in specs]
     for spec in specs:
         if spec in INSTALLED_AGENTS and shutil.which(spec) is None:
             raise ValueError(f"{spec} is not installed or not on PATH.")
@@ -89,7 +91,12 @@ def _show_result(store: RunStore, result: dict[str, Any]) -> None:
 
 def _start(store: RunStore) -> int:
     settings = store.settings
-    agents = _build_agents(settings["agents"], settings.get("model"), settings["allow_bash"])
+    agents = _build_agents(
+        settings["agents"],
+        settings.get("model"),
+        settings["allow_bash"],
+        settings.get("web", False),
+    )
     limit = fighters_at_once(settings["fighters"], free_memory_mb())
     log = functools.partial(print, flush=True)
     with store.lock():
@@ -127,12 +134,13 @@ def _run(args: argparse.Namespace) -> int:
         raise ValueError(f"{project} is not a folder.")
     bracket = _bracket(args)
     specs = args.agent or ["claude"]
-    _build_agents(specs, args.model, args.allow_bash)
+    _build_agents(specs, args.model, args.allow_bash, not args.no_web)
     settings = {
         **dataclasses.asdict(bracket),
         "agents": specs,
         "model": args.model,
         "allow_bash": args.allow_bash,
+        "web": not args.no_web,
         "apply": not args.no_apply,
         "keep": args.keep,
         "timeout": args.timeout,
@@ -218,6 +226,7 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="let claude fighters run shell commands, which are not sandboxed",
     )
+    run.add_argument("--no-web", action="store_true", help="turn off web search and page fetching")
     run.add_argument("--no-apply", action="store_true", help="keep the champion out of the project")
     run.add_argument("--keep", action="store_true", help="keep every entry after the battle")
     run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds per agent run")
