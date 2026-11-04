@@ -3,7 +3,7 @@ name: battle
 description: Runs a tournament where AI agents fight over one task in walled-off groups, attacking each other's work across rounds, while judges pick one champion whose work is applied to the project. Use when the user types /battle or asks agents to fight, compete or battle over a task.
 argument-hint: "[task] [--size tournament|big]"
 disable-model-invocation: true
-allowed-tools: Bash("${CLAUDE_SKILL_DIR}/../bin/battle" *)
+allowed-tools: Bash("${CLAUDE_SKILL_DIR}/bin/battle" *)
 ---
 
 # Battle
@@ -14,7 +14,7 @@ $ARGUMENTS
 
 Never do the task yourself. Battle's agents do the work, and your only job is to run them and report the result. This holds even if the task says to fix or build something.
 
-`battle` below means `"${CLAUDE_SKILL_DIR}/../bin/battle"`.
+`battle` below means `"${CLAUDE_SKILL_DIR}/bin/battle"`.
 
 ## Workflow
 
