@@ -422,10 +422,15 @@ def _reply(args: argparse.Namespace) -> int:
 def _install(args: argparse.Namespace) -> int:
     claude = Path.home() / ".claude"
     links = {
-        claude / "skills" / "battle": ROOT / "skill",
+        claude / "skills" / "battle": ROOT,
         claude / "agents" / "battle-fighter.md": ROOT / "agents" / "battle-fighter.md",
         claude / "agents" / "battle-judge.md": ROOT / "agents" / "battle-judge.md",
         claude / "agents" / "battle-lead.md": ROOT / "agents" / "battle-lead.md",
+    }
+    links = {
+        link: target
+        for link, target in links.items()
+        if link.is_symlink() or not link.exists() or link.resolve() != target.resolve()
     }
     taken = [str(link) for link in links if link.exists() and not link.is_symlink()]
     if taken:

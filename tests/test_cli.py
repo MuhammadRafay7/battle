@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -510,6 +511,27 @@ def test_install_can_run_twice(tmp_path, capsys, monkeypatch):
     assert cli.main(["install"]) == 0
 
 
+def test_install_works_when_unzipped_straight_into_the_skills_folder(tmp_path):
+    home = tmp_path / "user"
+    unzipped = home / ".claude" / "skills" / "battle"
+    shutil.copytree(
+        ROOT, unzipped, ignore=shutil.ignore_patterns(".git", ".battle", "__pycache__")
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(unzipped / "bin" / "battle"), "install"],
+        env={**os.environ, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not unzipped.is_symlink()
+    assert (unzipped / "SKILL.md").exists()
+    fighter = home / ".claude" / "agents" / "battle-fighter.md"
+    assert fighter.resolve() == unzipped / "agents" / "battle-fighter.md"
+
+
 def test_install_refuses_to_replace_a_file_you_wrote(tmp_path, capsys, monkeypatch):
     home = tmp_path / "user"
     monkeypatch.setenv("HOME", str(home))
@@ -546,17 +568,17 @@ def test_agent_definitions_keep_their_tools_and_guard(name, role, tools):
 
 
 def test_skill_carries_on_after_asking_for_a_missing_task():
-    skill = (ROOT / "skill" / "SKILL.md").read_text()
+    skill = (ROOT / "SKILL.md").read_text()
     assert "continue from step 2" in skill
 
 
 def test_skill_forbids_the_chat_from_doing_the_task_itself():
-    skill = (ROOT / "skill" / "SKILL.md").read_text()
+    skill = (ROOT / "SKILL.md").read_text()
     assert "Never do the task yourself" in skill
 
 
 def test_skill_stops_leftover_agents_when_the_battle_ends():
-    skill = (ROOT / "skill" / "SKILL.md").read_text()
+    skill = (ROOT / "SKILL.md").read_text()
     assert "stop every agent still running" in skill
 
 

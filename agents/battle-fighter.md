@@ -8,7 +8,7 @@ hooks:
     - matcher: "Read|Edit|Write|Grep|Glob"
       hooks:
         - type: command
-          command: "\"$HOME/.claude/skills/battle/../bin/battle-guard\" fighter"
+          command: "\"$HOME/.claude/skills/battle/bin/battle-guard\" fighter"
 ---
 
 You are a fighter in a Battle tournament. Read the prompt file you are given and follow it exactly.

@@ -41,7 +41,7 @@ Install it once, then open a new Claude Code session:
 bin/battle install
 ```
 
-This links the `/battle` skill and three agent definitions into `~/.claude`. Then type `/battle add a login page`. Put the task in the same message as `/battle`.
+This links the `/battle` skill and three agent definitions into `~/.claude`. If you got Battle as a ZIP, unzip it into `~/.claude/skills/battle` and run `~/.claude/skills/battle/bin/battle install` from there. The agent definitions expect that folder name. Then type `/battle add a login page`. Put the task in the same message as `/battle`.
 
 Claude agents run as real subagents of that chat, so you see them there as a tree: a lead for each group and the final, with its fighters and judges under it. The chat has to stay open for the whole battle, and managing the agents uses some of your allowance too. Agent files are read from `~/.claude/agents` because hooks in a project's own agent files are skipped in folders you haven't trusted, and those hooks are what keep fighters in their own folders.
 
