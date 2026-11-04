@@ -7,6 +7,7 @@ dependencies = []
 
 [project.scripts]
 battle = "battle.cli:main"
+team = "battle.team.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
@@ -16,7 +17,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["battle"]
+packages = ["battle", "battle.team"]
 
 [tool.setuptools.package-data]
 battle = ["rules.md"]
