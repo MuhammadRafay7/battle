@@ -11,25 +11,27 @@ from battle.sizing import (
 )
 
 
-def test_presets_match_the_two_tournament_sizes():
-    assert PRESETS["default"] == Bracket(groups=2, fighters=4)
+def test_presets_match_the_battle_sizes():
+    assert PRESETS["default"] == Bracket(groups=1, fighters=3, rounds=1)
+    assert PRESETS["tournament"] == Bracket(groups=2, fighters=4)
     assert PRESETS["big"] == Bracket(groups=4, fighters=5)
 
 
 def test_estimated_runs_counts_every_agent_in_the_tournament():
-    assert PRESETS["default"].estimated_runs() == 38
-    assert PRESETS["big"].estimated_runs() == 80
+    assert PRESETS["default"].estimated_runs() == 3 + 1 + 1
+    assert PRESETS["tournament"].estimated_runs() == 29
+    assert PRESETS["big"].estimated_runs() == 57
 
 
-def test_one_group_has_no_final_to_fight():
+def test_one_group_skips_directions_head_check_and_final():
     bracket = Bracket(groups=1, fighters=3, rounds=2, final_rounds=2)
     assert bracket.finalists == 1
-    assert bracket.estimated_runs() == 1 + 6 + 1 + 1 + 0
+    assert bracket.estimated_runs() == 6 + 1 + 1
 
 
 @pytest.mark.parametrize(
     "changes",
-    [{"groups": 0}, {"groups": 27}, {"fighters": 1}, {"rounds": 1}, {"final_rounds": 0}],
+    [{"groups": 0}, {"groups": 27}, {"fighters": 1}, {"rounds": 0}, {"final_rounds": 0}],
 )
 def test_bracket_rejects_sizes_that_cannot_fight(changes):
     values = {"groups": 2, "fighters": 4, "rounds": 3, "final_rounds": 2} | changes

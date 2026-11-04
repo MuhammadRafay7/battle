@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from battle import prompts, report
-from battle.agents import AgentError, AgentStopped, UsageLimitReached
+from battle.agents import AgentError, AgentStopped, AgentTimedOut, UsageLimitReached
 from battle.fight import BattleError, Fight, Fighter, Stopped, apply_champion
 from battle.sizing import Bracket
 from battle.store import RunStore
@@ -98,6 +98,60 @@ def test_no_agent_is_told_about_the_web_when_it_is_off(project):
     fight.run()
 
     assert not any(prompts.WEB_RESEARCH in job.prompt for job in agent.jobs)
+
+
+def test_jobs_are_marked_with_who_leads_them(project):
+    agent = FakeAgent(champion="A3")
+    _, fight = battle(project, agent)
+
+    fight.run()
+
+    groups: dict[str, set[str]] = {}
+    for job in agent.jobs:
+        groups.setdefault(job.role, set()).add(job.group)
+    assert groups["director"] == {""}
+    assert groups["fighter"] == {"A", "B", "final", ""}
+    assert groups["group-judge"] == {"A", "B"}
+    assert groups["head-check"] == {""}
+    assert groups["specialist"] == {"final"}
+    assert groups["head-champion"] == {""}
+
+
+def test_each_group_is_closed_once_its_work_is_done(project):
+    closed = []
+
+    class Closing(FakeAgent):
+        def close_group(self, group):
+            closed.append(group)
+
+    _, fight = battle(project, Closing())
+
+    fight.run()
+
+    assert sorted(closed) == ["A", "B", "final"]
+
+
+def test_a_group_with_no_fighters_left_is_closed_too(project):
+    closed = []
+
+    class Closing(FakeAgent):
+        def close_group(self, group):
+            closed.append(group)
+
+    _, fight = battle(project, Closing(fail=("A1", "A2", "A3")))
+
+    fight.run()
+
+    assert "A" in closed
+
+
+def test_rounds_ask_fighters_to_finish_quickly(project):
+    agent = FakeAgent()
+    _, fight = battle(project, agent)
+
+    fight.run()
+
+    assert "holds up the whole battle" in fighter_prompts(agent, "A1")[1]
 
 
 def test_rulebook_has_ten_numbered_rules():
@@ -196,7 +250,7 @@ def test_every_role_appears_in_the_right_number(project):
 
     assert Counter(job.role for job in agent.jobs) == {
         "director": 1,
-        "fighter": 12 + 2,
+        "fighter": 12 + 2 + 1,
         "group-judge": 2,
         "head-check": 1,
         "specialist": 5,
@@ -235,7 +289,7 @@ def test_fighters_in_a_group_get_different_angles(project):
 
 
 def test_groups_are_walled_off_until_the_final(project):
-    agent = FakeAgent(champion="A3")
+    agent = FakeAgent(champion="A3", fixes=())
     _, fight = battle(project, agent)
 
     fight.run()
@@ -280,7 +334,7 @@ def test_group_judge_sees_the_final_attacks(project):
 
 
 def test_head_judge_can_overturn_a_group_verdict(project):
-    agent = FakeAgent(overturn={"A": "A1"}, champion="A1")
+    agent = FakeAgent(overturn={"A": "A1"}, champion="A1", fixes=())
     _, fight = battle(project, agent)
 
     result = fight.run()
@@ -388,7 +442,7 @@ def test_resumed_fighter_starts_from_its_last_saved_round(project):
     with pytest.raises(UsageLimitReached):
         fight.run()
 
-    second = FakeAgent(champion="A3")
+    second = FakeAgent(champion="A3", fixes=())
     Fight(RunStore.open(store.id), [second], limit=3, log=lambda message: None).run()
 
     assert (project / "work_A3.txt").read_text().count("work by A3") == 3
@@ -562,7 +616,7 @@ def test_a_battle_stopped_by_a_limit_in_parallel_groups_can_resume(project):
     with pytest.raises(UsageLimitReached):
         fight.run()
 
-    second = FakeAgent(champion="C3")
+    second = FakeAgent(champion="C3", fixes=())
     Fight(RunStore.open(store.id), [second], limit=9, log=lambda message: None).run()
 
     assert (project / "work_C3.txt").read_text().count("work by C3") == 3
@@ -840,3 +894,142 @@ def test_a_leftover_partial_champion_is_never_used(project):
 
     assert not (store.root / "champion" / "junk").exists()
     assert not (store.root / "champion.partial").exists()
+
+
+QUICK = {"groups": 1, "fighters": 3, "rounds": 1}
+
+
+def test_quick_battle_skips_directions_head_check_and_final(project):
+    agent = FakeAgent()
+    _, fight = battle(project, agent, **QUICK)
+
+    fight.run()
+
+    assert Counter(job.role for job in agent.jobs) == {"fighter": 3 + 1, "group-judge": 1}
+    assert len(agent.jobs) == Bracket(**QUICK).estimated_runs()
+
+
+def test_quick_battle_hands_every_job_straight_to_the_chat(project):
+    agent = FakeAgent()
+    _, fight = battle(project, agent, **QUICK)
+
+    fight.run()
+
+    assert {job.group for job in agent.jobs} == {""}
+
+
+def test_quick_judge_reads_every_diff_in_its_prompt(project):
+    agent = FakeAgent()
+    _, fight = battle(project, agent, **QUICK)
+
+    fight.run()
+
+    judge = prompts_for(agent, "group-judge")[0]
+    for fighter in ("A1", "A2", "A3"):
+        assert f"=== {fighter}/changes.diff ===" in judge
+        assert f"+work by {fighter}" in judge
+
+
+def test_judge_reads_diffs_from_disk_when_they_are_too_big(project, monkeypatch):
+    monkeypatch.setattr("battle.fight.INLINE_DIFF_CHARS", 10)
+    agent = FakeAgent()
+    _, fight = battle(project, agent, **QUICK)
+
+    fight.run()
+
+    judge = prompts_for(agent, "group-judge")[0]
+    assert "too large to show here" in judge
+    assert "=== A1/changes.diff ===" not in judge
+
+
+def test_champion_polishes_the_judges_fixes_before_it_is_applied(project):
+    agent = FakeAgent(fixes=("app.py: validate the input",))
+    store, fight = battle(project, agent, **QUICK)
+
+    result = fight.run()
+
+    polish = fighter_prompts(agent, "A3")[-1]
+    assert "app.py: validate the input" in polish
+    assert "your entry won" in polish
+    assert result["champion"] == "A3"
+    assert (project / "work_A3.txt").read_text() == "work by A3\nwork by A3\n"
+    assert store.get("champion")["fixes"] == ["app.py: validate the input"]
+
+
+def test_no_fixes_means_no_polish_turn(project):
+    agent = FakeAgent(fixes=())
+    store, fight = battle(project, agent, **QUICK)
+
+    fight.run()
+
+    assert len(prompts_for(agent, "fighter")) == 3
+    assert not store.has("polish")
+    assert (project / "work_A3.txt").read_text() == "work by A3\n"
+
+
+def test_failed_polish_keeps_the_winning_entry(project):
+    @dataclass
+    class PolishFails(FakeAgent):
+        def _fighter(self, job):
+            if "your entry won" in job.prompt:
+                raise AgentError("polish crashed")
+            return super()._fighter(job)
+
+    store, fight = battle(project, PolishFails(), **QUICK)
+
+    result = fight.run()
+
+    assert result["applied"]
+    assert store.get("polish") == {"skipped": "The polish turn failed."}
+    assert (project / "work_A3.txt").read_text() == "work by A3\n"
+
+
+def test_judge_must_give_fixes_as_a_list_of_text(project):
+    @dataclass
+    class BadFixesOnce(FakeAgent):
+        sent_bad: bool = False
+
+        def _group_judge(self, job):
+            reply = json.loads(super()._group_judge(job))
+            if not self.sent_bad:
+                self.sent_bad = True
+                reply["fixes"] = "not a list"
+            return json.dumps(reply)
+
+    agent = BadFixesOnce()
+    _, fight = battle(project, agent, **QUICK)
+
+    fight.run()
+
+    judges = prompts_for(agent, "group-judge")
+    assert len(judges) == 2
+    assert "fixes must be a list of strings" in judges[1]
+
+
+def test_a_fighter_that_times_out_is_not_retried(project):
+    @dataclass
+    class SlowA1(FakeAgent):
+        def _fighter(self, job):
+            if "You are fighter A1" in job.prompt:
+                raise AgentTimedOut("fake timed out")
+            return super()._fighter(job)
+
+    agent = SlowA1()
+    store, fight = battle(project, agent, **QUICK)
+
+    fight.run()
+
+    assert len(fighter_prompts(agent, "A1")) == 1
+    assert store.get("group-A/r1/A1")["forfeit"]
+
+
+def test_report_lists_the_fixes_and_what_the_polish_did(project):
+    agent = FakeAgent(fixes=("app.py: validate the input",))
+    store, fight = battle(project, agent, **QUICK)
+
+    fight.run()
+
+    text = report.render(store)
+    assert "## Fixes after judging" in text
+    assert "- app.py: validate the input" in text
+    assert "A3 worked" in text

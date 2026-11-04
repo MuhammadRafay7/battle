@@ -9,13 +9,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from battle.agents import AgentError, AgentStopped, Job, UsageLimitReached
+from battle.agents import AgentError, AgentStopped, AgentTimedOut, Job, UsageLimitReached
 
 SUBAGENT_MODELS = ("fable", "opus", "sonnet", "haiku")
 REPLY = ".reply"
 FAILED = ".failed"
 LIMIT = ".limit"
+CLOSED = ".closed"
+LEAD = ".lead"
+LEAD_MODEL = "haiku"
+FINAL = "final"
 JOB_ID = re.compile(r"^\d+$")
+BATTLE = Path(__file__).resolve().parent.parent / "bin" / "battle"
 
 
 def subagent_model(model: str | None) -> str | None:
@@ -49,15 +54,41 @@ def post_usage_limit(jobs_dir: Path, job_id: str, text: str) -> None:
     _post(jobs_dir, job_id, LIMIT, text)
 
 
-def claim_jobs(jobs_dir: Path) -> list[dict[str, Any]]:
+def _take(marker: Path) -> bool:
+    try:
+        marker.open("x").close()
+    except FileExistsError:
+        return False
+    return True
+
+
+def _lead_record(jobs_dir: Path, group: str) -> dict[str, Any]:
+    return {
+        "id": f"lead-{group}",
+        "role": "lead",
+        "label": "Final" if group == FINAL else f"Group {group}",
+        "subagent_type": "battle-lead",
+        "model": LEAD_MODEL,
+        "group": group,
+        "prompt": f'Battle: "{BATTLE}"\nRun: {jobs_dir.parent.name}\nGroup: {group}',
+    }
+
+
+def claim_jobs(jobs_dir: Path, group: str | None = None) -> list[dict[str, Any]]:
     records = []
     for path in sorted(jobs_dir.glob("*.json")):
-        try:
-            path.with_suffix(".claimed").open("x").close()
-        except FileExistsError:
-            continue
-        records.append(json.loads(path.read_text(encoding="utf-8")))
+        record = json.loads(path.read_text(encoding="utf-8"))
+        owner = record["group"]
+        if group is None and owner:
+            if _take(jobs_dir / f"{owner}{LEAD}"):
+                records.append(_lead_record(jobs_dir, owner))
+        elif owner == (group or "") and _take(path.with_suffix(".claimed")):
+            records.append(record)
     return records
+
+
+def group_done(jobs_dir: Path, group: str) -> bool:
+    return (jobs_dir / f"{group}{CLOSED}").exists()
 
 
 def reset_jobs(jobs_dir: Path) -> None:
@@ -82,6 +113,10 @@ class HostAgent:
     def cancel(self) -> None:
         self._cancelled.set()
 
+    def close_group(self, group: str) -> None:
+        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        (self.jobs_dir / f"{group}{CLOSED}").touch()
+
     def run(self, job: Job) -> str:
         return self._wait(self._publish(job), job.timeout)
 
@@ -100,6 +135,7 @@ class HostAgent:
             "id": job_id,
             "role": job.role,
             "label": job.label or job.role,
+            "group": job.group,
             "subagent_type": "battle-fighter" if job.writes else "battle-judge",
             "model": subagent_model(self.model),
             "cwd": str(job.cwd),
@@ -119,7 +155,7 @@ class HostAgent:
             if self._cancelled.is_set():
                 raise AgentStopped(f"Battle stopped job {job_id}.")
             if time.monotonic() >= deadline:
-                raise AgentError(f"Job {job_id} timed out after {timeout:g} seconds.")
+                raise AgentTimedOut(f"Job {job_id} timed out after {timeout:g} seconds.")
             time.sleep(self.poll_seconds)
 
     @staticmethod

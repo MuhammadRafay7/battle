@@ -273,6 +273,65 @@ def test_parallel_calls_from_one_agent_never_block_each_other(project):
     assert [path.name for path in claims.iterdir()] == ["agent-1"]
 
 
+BATTLE = str(ROOT / "bin" / "battle")
+
+
+def lead_bash(project, command):
+    return call(project, "Bash", command=command)
+
+
+@pytest.mark.parametrize("agent", ["battle-fighter", "battle-judge"])
+def test_lead_can_start_guarded_agents(project, agent):
+    assert check(call(project, "Agent", subagent_type=agent, prompt="x"), "lead") is None
+
+
+@pytest.mark.parametrize("tool", ["Agent", "Task"])
+@pytest.mark.parametrize("agent", ["general-purpose", "Explore", "battle-lead", None])
+def test_lead_cannot_start_an_unguarded_agent(project, tool, agent):
+    assert check(call(project, tool, subagent_type=agent, prompt="x"), "lead")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f'"{BATTLE}" jobs 20261031-091900-467720 --group A',
+        f'"{BATTLE}" jobs 20261031-091900-467720 --group final',
+        f"\"{BATTLE}\" reply 1793 20261031-091900-467720 <<'BATTLE_REPLY'\n{{\"a\": \"$(x)\"}}\nBATTLE_REPLY",
+        f"\"{BATTLE}\" reply 1793 20261031-091900-467720 --failed <<'BATTLE_REPLY'\ncrashed\nBATTLE_REPLY",
+        f"\"{BATTLE}\" reply 1793 20261031-091900-467720 --usage-limit <<'BATTLE_REPLY'\nlimit\nBATTLE_REPLY",
+    ],
+)
+def test_lead_can_run_battle_commands(project, command):
+    assert check(lead_bash(project, command), "lead") is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat .env",
+        "rm -rf .",
+        f'"{BATTLE}" undo',
+        f'"{BATTLE}" apply --force',
+        f'"{BATTLE}" jobs r1 --group A; rm -rf .',
+        f'"{BATTLE}" jobs r1 --group A && cat .env',
+        f'"{BATTLE}" jobs $(cat .env) --group A',
+        f'"{BATTLE}" jobs r1 --group A\nrm -rf .',
+        '"/tmp/evil/bin/battle" jobs r1 --group A',
+        f"\"{BATTLE}\" reply 1 r1 <<'BATTLE_REPLY'\ntext\nBATTLE_REPLY\nrm -rf .",
+        f"\"{BATTLE}\" reply 1 r1 <<'BATTLE_REPLY'\nBATTLE_REPLY\nrm -rf .\nBATTLE_REPLY",
+        f'"{BATTLE}" reply 1 r1 <<BATTLE_REPLY\n$(rm -rf .)\nBATTLE_REPLY',
+        f"\"{BATTLE}\" reply 1 r1 <<'BATTLE_REPLY'\nno end",
+    ],
+)
+def test_lead_cannot_run_anything_else(project, command):
+    assert check(lead_bash(project, command), "lead")
+
+
+@pytest.mark.parametrize("tool", ["Read", "Write", "Edit", "Grep", "Glob"])
+def test_lead_has_no_file_tools(project, tool):
+    assert check(call(project, tool, file_path=str(project / "app.py"), path=str(project)), "lead")
+
+
 def run_script(role, stdin):
     return subprocess.run(
         [str(ROOT / "bin" / "battle-guard"), role], input=stdin, capture_output=True, text=True

@@ -19,7 +19,7 @@ from typing import Any, BinaryIO, Mapping, Protocol
 from battle import tether
 from battle.tether import EXIT_CANNOT_START, MARK_VARIABLE, START_FAILED, kill_marked
 
-DEFAULT_TIMEOUT = 1800.0
+DEFAULT_TIMEOUT = 1200.0
 TETHER = str(Path(tether.__file__).resolve())
 POLL_SECONDS = 0.2
 REAP_SECONDS = 2.0
@@ -63,6 +63,10 @@ class AgentStopped(AgentError):
     pass
 
 
+class AgentTimedOut(AgentError):
+    pass
+
+
 @dataclass(frozen=True)
 class Job:
     role: str
@@ -72,6 +76,7 @@ class Job:
     read_dirs: tuple[Path, ...] = ()
     timeout: float = DEFAULT_TIMEOUT
     label: str = ""
+    group: str = ""
 
 
 class Agent(Protocol):
@@ -172,7 +177,7 @@ def _await_exit(process: subprocess.Popen, name: str, job: Job, groups: ProcessG
             if groups.cancelled.is_set():
                 raise AgentStopped(f"{name} was stopped.") from error
             if time.monotonic() >= deadline:
-                raise AgentError(f"{name} timed out after {job.timeout:g} seconds.") from error
+                raise AgentTimedOut(f"{name} timed out after {job.timeout:g} seconds.") from error
             continue
         if groups.cancelled.is_set() and process.returncode != 0:
             raise AgentStopped(f"{name} was stopped.")

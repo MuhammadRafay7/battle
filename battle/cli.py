@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -19,10 +20,12 @@ from battle.fight import Fight, apply_champion, roll_back_cut_off_apply, undo_ch
 from battle.host import (
     HostAgent,
     claim_jobs,
+    group_done,
     post_failure,
     post_reply,
     post_usage_limit,
     reset_jobs,
+    subagent_model,
 )
 from battle.sizing import PRESETS, Bracket, fighters_at_once, free_memory_mb
 from battle.store import AlreadyRunning, RunNotFound, RunStore, latest_run
@@ -37,6 +40,8 @@ HOST_AGENT = "host"
 HOST_LIMIT = 20
 ROOT = Path(__file__).resolve().parent.parent
 WAITING_STATUSES = ("prepared", "running")
+ENGINE_WAIT_SECONDS = 10
+STOP_WAIT_SECONDS = 30
 
 
 def _fail(message: str) -> int:
@@ -105,11 +110,17 @@ def _describe(bracket: Bracket, requested: int | None) -> None:
     free_mb = free_memory_mb()
     at_once = requested or fighters_at_once(bracket.total_fighters, free_mb)
     memory = "unknown" if free_mb is None else f"{free_mb} MB"
-    print(
-        f"Size: {bracket.groups} groups of {bracket.fighters} "
-        f"({bracket.total_fighters} fighters)"
-    )
-    print(f"Rounds: {bracket.rounds} per group, {bracket.final_rounds} in the final")
+    if bracket.groups == 1:
+        print(f"Size: 1 group of {bracket.fighters} fighters")
+    else:
+        print(
+            f"Size: {bracket.groups} groups of {bracket.fighters} "
+            f"({bracket.total_fighters} fighters)"
+        )
+    if bracket.groups == 1:
+        print(f"Rounds: {bracket.rounds}, then one judge and a polish turn for the winner")
+    else:
+        print(f"Rounds: {bracket.rounds} per group, {bracket.final_rounds} in the final")
     print(f"Free memory with swap: {memory}, so up to {at_once} agents run at once")
     print(f"Agent runs: about {bracket.estimated_runs()}, all from your plan's allowance")
 
@@ -201,6 +212,7 @@ def _live_status(store: RunStore) -> str:
 
 def _start(store: RunStore) -> int:
     with store.lock():
+        (store.root / "engine.pid").write_text(str(os.getpid()), encoding="utf-8")
         if store.status == "done":
             with _stop_on_signals(_finish_first):
                 rolled_back = roll_back_cut_off_apply(store)
@@ -242,6 +254,10 @@ def _require_valid_host(args: argparse.Namespace) -> None:
         raise ValueError("--no-web needs separate agents, so it can't use --agent host.")
     if not args.prepare:
         raise ValueError("--agent host needs --prepare, because a Claude Code chat runs its agents.")
+    if args.model is None:
+        raise ValueError("--agent host needs --model, or fighters would run on their lead's model.")
+    if subagent_model(args.model) is None:
+        raise ValueError(f"A Claude Code chat can't start {args.model}.")
 
 
 def _exclude_from_git(project: Path) -> None:
@@ -291,8 +307,48 @@ def _run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _wait_until(ready: Callable[[], bool], seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while not ready():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def _detach(store: RunStore) -> int:
+    with (store.root / "engine.log").open("a", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [sys.executable, str(ROOT / "bin" / "battle"), "resume", store.id],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    started = _wait_until(
+        lambda: store.engine_running() or process.poll() is not None, ENGINE_WAIT_SECONDS
+    )
+    if not started or process.poll() not in (None, 0):
+        raise ValueError(f"The battle didn't start. See {store.root / 'engine.log'}")
+    print(f"Started battle {store.id} in the background.")
+    return 0
+
+
 def _resume(args: argparse.Namespace) -> int:
-    return _start(_open(args))
+    store = _open(args)
+    return _detach(store) if args.detach else _start(store)
+
+
+def _stop(args: argparse.Namespace) -> int:
+    store = _open(args)
+    if not store.engine_running():
+        raise ValueError(f"Battle {store.id} is not running.")
+    pid = int((store.root / "engine.pid").read_text(encoding="utf-8"))
+    os.kill(pid, signal.SIGTERM)
+    if not _wait_until(lambda: not store.engine_running(), STOP_WAIT_SECONDS):
+        raise ValueError(f"Battle {store.id} didn't stop. Its process is {pid}.")
+    print(f"Stopped. Continue with: battle resume {store.id}")
+    return 0
 
 
 def _status(args: argparse.Namespace) -> int:
@@ -342,11 +398,14 @@ def _jobs(args: argparse.Namespace) -> int:
         jobs_dir = store.root / "jobs"
         status = _live_status(store)
         waiting = status in WAITING_STATUSES
-        jobs = claim_jobs(jobs_dir) if waiting and jobs_dir.exists() else []
-        if jobs or not waiting or time.monotonic() >= deadline:
+        jobs = claim_jobs(jobs_dir, args.group) if waiting and jobs_dir.exists() else []
+        done = bool(args.group) and group_done(jobs_dir, args.group)
+        if jobs or done or not waiting or time.monotonic() >= deadline:
             break
         time.sleep(0.5)
     payload: dict[str, Any] = {"run": run_id, "status": status, "jobs": jobs}
+    if args.group:
+        payload["group_done"] = done
     if status == "done":
         payload["report"] = str(store.root / "report.md")
     print(json.dumps(payload, indent=2))
@@ -366,6 +425,7 @@ def _install(args: argparse.Namespace) -> int:
         claude / "skills" / "battle": ROOT / "skill",
         claude / "agents" / "battle-fighter.md": ROOT / "agents" / "battle-fighter.md",
         claude / "agents" / "battle-judge.md": ROOT / "agents" / "battle-judge.md",
+        claude / "agents" / "battle-lead.md": ROOT / "agents" / "battle-lead.md",
     }
     taken = [str(link) for link in links if link.exists() and not link.is_symlink()]
     if taken:
@@ -422,8 +482,13 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds per agent run")
     run.set_defaults(handler=_run)
 
+    resume = commands.add_parser("resume", help="start or continue a battle")
+    resume.add_argument("id", nargs="?", help="battle id, or the latest one if left out")
+    resume.add_argument("--detach", action="store_true", help="run on its own in the background")
+    resume.set_defaults(handler=_resume)
+
     for name, handler, description in (
-        ("resume", _resume, "continue a paused, stopped or failed battle"),
+        ("stop", _stop, "stop a running battle"),
         ("status", _status, "show a battle's progress"),
         ("undo", _undo, "restore the project from before the champion was applied"),
     ):
@@ -434,6 +499,7 @@ def _parser() -> argparse.ArgumentParser:
     jobs = commands.add_parser("jobs", help="hand waiting jobs to the chat as JSON")
     jobs.add_argument("id", nargs="?", help="battle id, or the latest one if left out")
     jobs.add_argument("--wait-seconds", type=float, default=100, help="how long to wait for a job")
+    jobs.add_argument("--group", help="only this group's jobs, for its lead")
     jobs.set_defaults(handler=_jobs)
 
     reply = commands.add_parser("reply", help="send a subagent's final message from stdin")

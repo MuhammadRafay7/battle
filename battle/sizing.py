@@ -15,16 +15,16 @@ MAX_GROUPS = 26
 class Bracket:
     groups: int
     fighters: int
-    rounds: int = 3
-    final_rounds: int = 2
+    rounds: int = 2
+    final_rounds: int = 1
 
     def __post_init__(self) -> None:
         if not 1 <= self.groups <= MAX_GROUPS:
             raise ValueError(f"A battle needs 1 to {MAX_GROUPS} groups.")
         if self.fighters < 2:
             raise ValueError("A group needs at least 2 fighters.")
-        if self.rounds < 2:
-            raise ValueError("A group needs at least 2 rounds, or nobody gets attacked.")
+        if self.rounds < 1:
+            raise ValueError("A group needs at least 1 round.")
         if self.final_rounds < 1:
             raise ValueError("The final needs at least 1 round.")
 
@@ -37,12 +37,13 @@ class Bracket:
         return self.groups
 
     def estimated_runs(self) -> int:
-        directions = 1
         group_fights = self.total_fighters * self.rounds
         group_judges = self.groups
+        polish = 1
+        if self.groups == 1:
+            return group_fights + group_judges + polish
+        directions = 1
         head_check = 1
-        if self.finalists < 2:
-            return directions + group_fights + group_judges + head_check
         final = self.finalists * self.final_rounds
         champion_pick = 1
         return (
@@ -53,11 +54,13 @@ class Bracket:
             + final
             + SPECIALIST_JUDGES
             + champion_pick
+            + polish
         )
 
 
 PRESETS = {
-    "default": Bracket(groups=2, fighters=4),
+    "default": Bracket(groups=1, fighters=3, rounds=1),
+    "tournament": Bracket(groups=2, fighters=4),
     "big": Bracket(groups=4, fighters=5),
 }
 

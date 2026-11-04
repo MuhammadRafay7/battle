@@ -8,7 +8,15 @@ import tempfile
 from pathlib import Path
 from typing import Any, Sequence
 
-ROLES = ("fighter", "judge")
+ROLES = ("fighter", "judge", "lead")
+AGENT_TOOLS = ("Agent", "Task")
+LEAD_AGENTS = ("battle-fighter", "battle-judge")
+REPLY_END = "BATTLE_REPLY"
+BATTLE = Path(__file__).resolve().parent.parent / "bin" / "battle"
+JOBS_COMMAND = re.compile(r'^"(?P<path>[^"]+)" jobs [\w-]+ --group \w+$')
+REPLY_COMMAND = re.compile(
+    rf"""^"(?P<path>[^"]+)" reply \d+ [\w-]+(?: --failed| --usage-limit)? <<'{REPLY_END}'$"""
+)
 FILE_TOOLS = ("Read", "Edit", "Write")
 EXIT_BLOCKED = 2
 BEFORE_FIRST_RUN = r"(?:(?!/\.battle/runs/).)*"
@@ -63,9 +71,30 @@ def _check_prompt(prompt: str, role: str, agent: str | None) -> str | None:
     return None
 
 
+def _approved_command(command: str) -> bool:
+    lines = command.strip().split("\n")
+    single = len(lines) == 1
+    match = (JOBS_COMMAND if single else REPLY_COMMAND).match(lines[0])
+    if match is None or os.path.realpath(match["path"]) != os.path.realpath(BATTLE):
+        return False
+    return single or (lines[-1] == REPLY_END and REPLY_END not in lines[1:-1])
+
+
+def _check_lead(tool: str, tool_input: dict[str, Any]) -> str | None:
+    if tool in AGENT_TOOLS:
+        if tool_input.get("subagent_type") in LEAD_AGENTS:
+            return None
+        return "A lead can only start battle-fighter and battle-judge agents."
+    if tool == "Bash" and _approved_command(tool_input["command"]):
+        return None
+    return "A lead can only run battle jobs and battle reply."
+
+
 def check(payload: dict[str, Any], role: str) -> str | None:
     tool = payload["tool_name"]
     tool_input = payload["tool_input"]
+    if role == "lead":
+        return _check_lead(tool, tool_input)
     target = tool_input.get("file_path" if tool in FILE_TOOLS else "path")
     if not target or target.startswith("~"):
         return "Pass an absolute path inside your folder."

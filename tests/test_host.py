@@ -9,6 +9,7 @@ from battle.fight import Fight
 from battle.host import (
     HostAgent,
     claim_jobs,
+    group_done,
     post_failure,
     post_reply,
     post_usage_limit,
@@ -53,11 +54,16 @@ class Chat:
         self.done.set()
         self.thread.join(timeout=5)
 
-    def loop(self):
+    def loop(self, group=None):
         while not self.done.is_set():
-            for record in claim_jobs(self.jobs_dir):
+            if group and group_done(self.jobs_dir, group):
+                return
+            for record in claim_jobs(self.jobs_dir, group):
                 self.records.append(record)
-                threading.Thread(target=self.answer, args=(record,), daemon=True).start()
+                if record["role"] == "lead":
+                    threading.Thread(target=self.loop, args=(record["group"],), daemon=True).start()
+                else:
+                    threading.Thread(target=self.answer, args=(record,), daemon=True).start()
             time.sleep(0.01)
 
     def answer(self, record):
@@ -109,6 +115,77 @@ def test_chat_gets_every_role_with_the_right_subagent_type(project):
     assert types["fighter"] == "battle-fighter"
     for role in ("director", "group-judge", "head-check", "specialist", "head-champion"):
         assert types[role] == "battle-judge"
+
+
+def test_the_tree_has_a_lead_for_each_group_and_the_final(project):
+    _, jobs_dir, fight = battle(project)
+
+    with Chat(jobs_dir, FakeAgent()) as chat:
+        fight.run()
+
+    leads = [record for record in chat.records if record["role"] == "lead"]
+    assert sorted(record["group"] for record in leads) == ["A", "B", "final"]
+    assert {record["subagent_type"] for record in leads} == {"battle-lead"}
+    assert {record["model"] for record in leads} == {"haiku"}
+    assert sorted(record["label"] for record in leads) == ["Final", "Group A", "Group B"]
+
+
+def test_fighters_keep_the_battles_model_under_a_cheap_lead(project):
+    store = RunStore.create("task", project, {"groups": 1})
+    agent = HostAgent(store.root / "jobs", model="claude-fable-5-1", poll_seconds=0.01)
+    waiter = threading.Thread(target=lambda: _ignore(agent, job(project, group="A", timeout=0.3)))
+    waiter.start()
+    while not (records := claim_jobs(store.root / "jobs", "A")):
+        time.sleep(0.01)
+    waiter.join()
+
+    assert records[0]["model"] == "fable"
+
+
+def grouped(tmp_path, *groups):
+    agent = HostAgent(tmp_path / "run" / "jobs", poll_seconds=0.01)
+    threads = [
+        threading.Thread(target=lambda g=g: _ignore(agent, job(tmp_path, group=g, timeout=0.3)))
+        for g in groups
+    ]
+    for thread in threads:
+        thread.start()
+    while len(list((tmp_path / "run" / "jobs").glob("*.json"))) < len(groups):
+        time.sleep(0.01)
+    return tmp_path / "run" / "jobs", threads
+
+
+def test_chat_gets_one_lead_per_group_and_only_ungrouped_jobs(tmp_path):
+    jobs_dir, threads = grouped(tmp_path, "A", "A", "B", "")
+
+    records = claim_jobs(jobs_dir)
+
+    assert sorted(record["role"] for record in records) == ["fighter", "lead", "lead"]
+    assert claim_jobs(jobs_dir) == []
+    for thread in threads:
+        thread.join()
+
+
+def test_a_lead_sees_only_its_own_group(tmp_path):
+    jobs_dir, threads = grouped(tmp_path, "A", "A", "B")
+
+    assert len(claim_jobs(jobs_dir, "A")) == 2
+    assert claim_jobs(jobs_dir, "A") == []
+    assert len(claim_jobs(jobs_dir, "B")) == 1
+    for thread in threads:
+        thread.join()
+
+
+def test_lead_prompt_says_where_to_get_work(tmp_path):
+    jobs_dir, threads = grouped(tmp_path, "A")
+
+    lead = claim_jobs(jobs_dir)[0]
+
+    assert '"' + str(Path(__file__).resolve().parent.parent / "bin" / "battle") + '"' in lead["prompt"]
+    assert "Run: run" in lead["prompt"]
+    assert "Group: A" in lead["prompt"]
+    for thread in threads:
+        thread.join()
 
 
 def test_limit_applies_across_the_chat(project):

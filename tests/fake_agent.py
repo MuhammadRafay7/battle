@@ -33,6 +33,7 @@ class FakeAgent:
     overturn: dict[str, str] = field(default_factory=dict)
     runner_up: str | None = None
     champion: str | None = None
+    fixes: tuple[str, ...] = ("app.py: check the input",)
     jobs: list[Job] = field(default_factory=list)
     seen_rivals: dict[str, list[list[str]]] = field(default_factory=dict)
 
@@ -94,7 +95,9 @@ class FakeAgent:
         winner = "Z9" if self.invalid_winner else fighters[-1]
         scored = [*fighters, "Z9"] if self.scores_stranger else fighters
         scores = {fighter: {category: 7 for category in CATEGORIES} for fighter in scored}
-        return json.dumps({"winner": winner, "scores": scores, "reason": "best evidence"})
+        return json.dumps(
+            {"winner": winner, "scores": scores, "reason": "best evidence", "fixes": list(self.fixes)}
+        )
 
     def _head_check(self, job: Job) -> str:
         picked = re.findall(r"Group (\w+): judge picked (\w+)", job.prompt)
@@ -115,7 +118,13 @@ class FakeAgent:
 
     def _head_champion(self, job: Job) -> str:
         finalists = _ids(r"Finalists: (.+)", job.prompt)
-        return json.dumps({"champion": self.champion or finalists[0], "reason": "top score"})
+        return json.dumps(
+            {
+                "champion": self.champion or finalists[0],
+                "reason": "top score",
+                "fixes": list(self.fixes),
+            }
+        )
 
 
 def main() -> int:

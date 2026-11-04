@@ -16,6 +16,7 @@ from battle.agents import (
     Agent,
     AgentError,
     AgentStopped,
+    AgentTimedOut,
     Job,
     UsageLimitReached,
     extract_json,
@@ -42,9 +43,16 @@ ANGLES = (
     "the best result for the end user",
     "the fastest and lightest",
 )
+SINGLE_DIRECTION = {
+    "name": "Best fit",
+    "brief": "Choose whatever approach suits this project best.",
+}
+INLINE_DIFF_CHARS = 60_000
+MAX_FIXES = 5
 COPY_LIMIT = 0.9
 ATTEMPTS = 2
 MAX_SCORE = 10
+FINAL = "final"
 
 Item = TypeVar("Item")
 Result = TypeVar("Result")
@@ -116,6 +124,7 @@ class Fight:
         web_access = prompts.WEB_RESEARCH if settings.get("web") else prompts.NO_WEB
         self._preamble = web_access + prompts.RULEBOOK
         self._log = log
+        self._roster: dict[str, Fighter] = {}
 
     def run(self) -> dict[str, Any]:
         self._say(f"Battle {self.store.id}: up to {self.limit} agents at once.")
@@ -128,10 +137,14 @@ class Fight:
         if not results:
             self._give_up("group-", "No fighter finished the group stage.")
 
-        finalists, entries = self._check_verdicts(results)
-        final = self._final(finalists, entries)
-        champion = self._pick_champion(final)
-        return self._finish(champion, final.entries[champion])
+        if len(results) == 1:
+            champion, entry = self._crown_group_winner(results[0])
+        else:
+            finalists, entries = self._check_verdicts(results)
+            final = self._final(finalists, entries)
+            champion = self._pick_champion(final)
+            entry = final.entries[champion]
+        return self._finish(champion, self._polish(champion, entry))
 
     def _say(self, message: str) -> None:
         self._log(message)
@@ -156,7 +169,16 @@ class Fight:
         copy_project(self.store.project, partial)
         partial.rename(self.baseline)
 
-    def _judge_job(self, role: str, prompt: str, cwd: Path) -> Job:
+    def _host_group(self, group: str) -> str:
+        return group if self.bracket.groups > 1 else ""
+
+    def _close_group(self, group: str) -> None:
+        for agent in self.agents:
+            close = getattr(agent, "close_group", None)
+            if close:
+                close(group)
+
+    def _judge_job(self, role: str, prompt: str, cwd: Path, group: str = "") -> Job:
         return Job(
             role,
             self._preamble + prompt,
@@ -164,10 +186,13 @@ class Fight:
             writes=False,
             read_dirs=(self.baseline,),
             timeout=self.timeout,
+            group=self._host_group(group) if group else "",
         )
 
     def _choose_directions(self) -> list[dict[str, str]]:
         count = self.bracket.groups
+        if count == 1:
+            return [SINGLE_DIRECTION]
 
         def check(value: dict[str, Any]) -> None:
             names = [item["name"] for item in value["directions"]]
@@ -202,13 +227,16 @@ class Fight:
             )
             for number in range(size)
         ]
+        self._roster.update({fighter.id: fighter for fighter in fighters})
         self._say(f"Group {group}: {direction['name']}")
         standing = self._rounds(f"group-{group}", fighters, {}, self.bracket.rounds, True)
         if not standing.alive:
             self._say(f"Group {group}: every fighter forfeited.")
+            self._close_group(group)
             return None
         review = self._review(f"group-{group}", standing)
         verdict = self._group_verdict(group, standing, review)
+        self._close_group(group)
         self._say(f"Group {group}: {verdict['winner']} wins.")
         return GroupResult(group, standing.alive, standing.entries, verdict)
 
@@ -230,9 +258,12 @@ class Fight:
             for fighter in ids:
                 for category in CATEGORIES:
                     _require_score(value["scores"][fighter][category], f"{fighter} {category}")
+            _require_fixes(value)
 
-        prompt = prompts.group_judge(group, self.store.task, ids, str(self.baseline))
-        return self._ask_json(key, self._judge_job("group-judge", prompt, review), check)
+        prompt = prompts.group_judge(
+            group, self.store.task, ids, str(self.baseline), _inline_diffs(review, ids)
+        )
+        return self._ask_json(key, self._judge_job("group-judge", prompt, review, group), check)
 
     def _rounds(
         self,
@@ -323,6 +354,7 @@ class Fight:
                 rivals,
                 workspace,
                 label,
+                self._host_group(fighter.group if scope.startswith("group-") else FINAL),
             )
             if reply is None:
                 result = {"forfeit": True, "reason": "It failed twice."}
@@ -348,17 +380,27 @@ class Fight:
         rivals: dict[str, Path],
         workspace: Path,
         label: str,
+        group: str,
     ) -> str | None:
         for attempt in range(1, ATTEMPTS + 1):
             materialize(self.baseline, entry, workspace)
             add_rivals(workspace, rivals)
             job = Job(
-                "fighter", prompt, workspace, writes=True, timeout=self.timeout, label=label
+                "fighter",
+                prompt,
+                workspace,
+                writes=True,
+                timeout=self.timeout,
+                label=label,
+                group=group,
             )
             try:
                 return self._run_agent(fighter.agent, job, label)
             except UsageLimitReached:
                 raise
+            except AgentTimedOut as error:
+                self._say(f"{fighter.id} failed: {error}")
+                return None
             except AgentError as error:
                 self._say(f"{fighter.id} failed on attempt {attempt}: {error}")
         return None
@@ -472,6 +514,7 @@ class Fight:
         if len(ids) == 1:
             if not self.store.has("champion"):
                 self.store.put("champion", {"champion": ids[0], "reason": "Last fighter standing."})
+            self._close_group(FINAL)
             return ids[0]
 
         review = self._review("final", final)
@@ -481,6 +524,7 @@ class Fight:
                 self._each(CATEGORIES, lambda category: self._specialist(category, ids, review)),
             )
         )
+        self._close_group(FINAL)
         totals = {
             fighter: sum(table[category]["scores"][fighter] for category in CATEGORIES)
             for fighter in ids
@@ -490,10 +534,53 @@ class Fight:
         def check(value: dict[str, Any]) -> None:
             if value["champion"] not in ids:
                 raise ValueError(f"{value['champion']} is not a finalist.")
+            _require_fixes(value)
 
         prompt = prompts.head_champion(self.store.task, ids, scores, totals)
         job = self._judge_job("head-champion", prompt, review)
         return self._ask_json("champion", job, check)["champion"]
+
+    def _crown_group_winner(self, result: GroupResult) -> tuple[str, Path]:
+        winner = result.verdict["winner"]
+        if not self.store.has("champion"):
+            self.store.put(
+                "champion",
+                {
+                    "champion": winner,
+                    "reason": result.verdict.get("reason", ""),
+                    "fixes": result.verdict.get("fixes") or [],
+                },
+            )
+        return winner, result.entries[winner]
+
+    def _polish(self, champion: str, entry: Path) -> Path:
+        fixes = [str(fix) for fix in self.store.get("champion").get("fixes") or []]
+        fixes = [fix for fix in fixes if fix.strip()][:MAX_FIXES]
+        fighter = self._roster.get(champion)
+        if not fixes or fighter is None:
+            return entry
+        polished = self._entry_path("polish", 1, champion)
+        if not self.store.has("polish"):
+            noun = "fix" if len(fixes) == 1 else "fixes"
+            self._say(f"Polish: {champion} is making the judge's {len(fixes)} {noun}.")
+            workspace = self.store.root / "workspace" / champion
+            label = f"{champion} (polish)"
+            prompt = self._preamble + prompts.polish(champion, self.store.task, fixes)
+            try:
+                reply = self._attempt_turn(fighter, prompt, entry, {}, workspace, label, "")
+                if reply is None:
+                    outcome: dict[str, Any] = {"skipped": "The polish turn failed."}
+                else:
+                    changes = capture(self.baseline, workspace, polished)
+                    outcome = self._read_turn(fighter, reply, changes)
+                    self._say(f"{label} finished: {len(changes['changed'])} files changed.")
+            finally:
+                shutil.rmtree(workspace, ignore_errors=True)
+            self.store.put("polish", outcome)
+        if self.store.get("polish").get("skipped"):
+            self._say(f"Polish skipped, so {champion}'s entry is kept as it was.")
+            return entry
+        return polished
 
     def _specialist(self, category: str, ids: list[str], review: Path) -> dict[str, Any]:
         def check(value: dict[str, Any]) -> None:
@@ -503,7 +590,7 @@ class Fight:
                 _require_score(value["scores"][fighter], f"{fighter} {category}")
 
         prompt = prompts.specialist(category, self.store.task, ids, str(self.baseline))
-        job = self._judge_job("specialist", prompt, review)
+        job = self._judge_job("specialist", prompt, review, FINAL)
         return self._ask_json(f"verdict/{category}", job, check)
 
     def _finish(self, champion: str, entry: Path) -> dict[str, Any]:
@@ -602,6 +689,21 @@ class Fight:
         if errors:
             raise errors[0]
         return [future.result() for future in futures]
+
+
+def _require_fixes(value: dict[str, Any]) -> None:
+    fixes = value.get("fixes", [])
+    if not isinstance(fixes, list) or not all(isinstance(fix, str) for fix in fixes):
+        raise ValueError("fixes must be a list of strings.")
+
+
+def _inline_diffs(review: Path, ids: list[str]) -> str | None:
+    parts = []
+    for fighter in ids:
+        diff = (review / fighter / "changes.diff").read_text(encoding="utf-8", errors="replace")
+        parts.append(f"=== {fighter}/changes.diff ===\n{diff or '(no changes)'}")
+    text = "\n".join(parts)
+    return text if len(text) <= INLINE_DIFF_CHARS else None
 
 
 def roll_back_cut_off_apply(store: RunStore) -> bool:

@@ -49,7 +49,7 @@ def test_plan_shows_the_size_without_running_anything(capsys):
     output = capsys.readouterr().out
     assert "4 groups of 5" in output
     assert "20 fighters" in output
-    assert "80" in output
+    assert "57" in output
     assert latest_run() is None
 
 
@@ -59,8 +59,9 @@ def test_plan_lets_every_fighter_run_at_once_when_memory_allows(capsys, monkeypa
     cli.main(["plan"])
 
     output = capsys.readouterr().out
-    assert "2 groups of 4" in output
-    assert "up to 8 agents run at once" in output
+    assert "1 group of 3 fighters" in output
+    assert "up to 3 agents run at once" in output
+    assert "about 5" in output
 
 
 def test_plan_caps_agents_when_memory_is_short(capsys, monkeypatch):
@@ -300,7 +301,7 @@ def test_launcher_works_through_a_symlink_from_any_folder(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "2 groups of 4" in result.stdout
+    assert "1 group of 3 fighters" in result.stdout
 
 
 HOST = ["--agent", "host"]
@@ -314,7 +315,11 @@ def in_project(project, monkeypatch):
 
 
 def prepare(project, *extra):
-    return cli.main(["run", "add a feature", "--project", str(project), "--prepare"] + HOST + list(extra))
+    return cli.main(
+        ["run", "add a feature", "--project", str(project), "--prepare", "--model", "fable"]
+        + HOST
+        + list(extra)
+    )
 
 
 def test_prepare_creates_a_host_run_inside_the_project_without_starting(in_project, capsys):
@@ -406,6 +411,87 @@ def test_reply_refuses_an_unknown_job(in_project, capsys, monkeypatch):
     assert "0042" in capsys.readouterr().err
 
 
+def test_host_needs_a_model_so_fighters_do_not_inherit_the_cheap_lead(in_project, capsys):
+    code = cli.main(["run", "x", "--project", str(in_project), "--prepare"] + HOST)
+    assert code == 1
+    assert "--model" in capsys.readouterr().err
+
+
+def test_host_refuses_a_model_the_chat_cannot_start(in_project, capsys):
+    code = cli.main(
+        ["run", "x", "--project", str(in_project), "--prepare", "--model", "gpt-9"] + HOST
+    )
+    assert code == 1
+    assert "gpt-9" in capsys.readouterr().err
+
+
+def test_jobs_for_a_group_says_when_that_group_is_done(in_project, capsys):
+    prepare(in_project)
+    store = RunStore.open(latest_run())
+    jobs = store.root / "jobs"
+    jobs.mkdir()
+    capsys.readouterr()
+
+    cli.main(["jobs", store.id, "--group", "A", "--wait-seconds", "0"])
+    assert json.loads(capsys.readouterr().out)["group_done"] is False
+
+    (jobs / "A.closed").touch()
+    cli.main(["jobs", store.id, "--group", "A", "--wait-seconds", "0"])
+    assert json.loads(capsys.readouterr().out)["group_done"] is True
+
+
+def wait_for(condition, seconds=20):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_detached_battle_outlives_the_command_that_started_it(project, capsys):
+    run_battle(project, "--prepare")
+    run_id = latest_run()
+
+    assert cli.main(["resume", run_id, "--detach"]) == 0
+
+    assert wait_for(lambda: RunStore.open(run_id).status == "done")
+    assert (project / "work_A2.txt").exists()
+
+
+def test_detach_returns_with_the_engine_already_running(project, capsys):
+    code = cli.main(
+        ["run", "x", "--project", str(project), "--agent", "command:sleep 30", "--prepare"]
+    )
+    assert code == 0
+    run_id = latest_run()
+
+    cli.main(["resume", run_id, "--detach"])
+    try:
+        assert RunStore.open(run_id).engine_running()
+    finally:
+        cli.main(["stop", run_id])
+
+
+def test_stop_ends_a_detached_battle(project, capsys):
+    cli.main(["run", "x", "--project", str(project), "--agent", "command:sleep 30", "--prepare"])
+    run_id = latest_run()
+    cli.main(["resume", run_id, "--detach"])
+
+    assert cli.main(["stop", run_id]) == 0
+
+    assert not RunStore.open(run_id).engine_running()
+    assert RunStore.open(run_id).status == "stopped"
+
+
+def test_stop_explains_when_nothing_is_running(project, capsys):
+    run_battle(project)
+    capsys.readouterr()
+
+    assert cli.main(["stop"]) == 1
+    assert "not running" in capsys.readouterr().err
+
+
 def test_install_links_the_skill_and_both_agents(tmp_path, capsys, monkeypatch):
     home = tmp_path / "user"
     monkeypatch.setenv("HOME", str(home))
@@ -415,6 +501,7 @@ def test_install_links_the_skill_and_both_agents(tmp_path, capsys, monkeypatch):
     assert (home / ".claude" / "skills" / "battle" / "SKILL.md").exists()
     assert (home / ".claude" / "agents" / "battle-fighter.md").is_symlink()
     assert (home / ".claude" / "agents" / "battle-judge.md").is_symlink()
+    assert (home / ".claude" / "agents" / "battle-lead.md").is_symlink()
 
 
 def test_install_can_run_twice(tmp_path, capsys, monkeypatch):
@@ -434,6 +521,14 @@ def test_install_refuses_to_replace_a_file_you_wrote(tmp_path, capsys, monkeypat
 
     assert custom.read_text() == "mine"
     assert "battle-judge.md" in capsys.readouterr().err
+
+
+def test_lead_definition_is_cheap_and_guards_every_tool_it_has():
+    text = (ROOT / "agents" / "battle-lead.md").read_text()
+    assert "tools: Bash, Agent" in text
+    assert "model: haiku" in text
+    assert 'matcher: "Bash|Agent|Task"' in text
+    assert 'battle-guard\\" lead"' in text
 
 
 @pytest.mark.parametrize(

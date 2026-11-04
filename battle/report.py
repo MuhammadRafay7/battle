@@ -7,7 +7,8 @@ from battle.store import RunStore, write_durable
 
 
 def _group_section(group: str, verdict: dict[str, Any], direction: str) -> list[str]:
-    lines = [f"### Group {group}: {direction}", "", f"Winner: **{verdict['winner']}**", ""]
+    heading = f"### Group {group}: {direction}" if direction else f"### Group {group}"
+    lines = [heading, "", f"Winner: **{verdict['winner']}**", ""]
     if verdict.get("reason"):
         lines += [str(verdict["reason"]), ""]
     if verdict.get("scores"):
@@ -66,6 +67,19 @@ def _overturned(steps: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _polish_section(steps: dict[str, Any]) -> list[str]:
+    fixes = steps.get("champion", {}).get("fixes") or []
+    if not fixes:
+        return []
+    lines = ["## Fixes after judging", "", *(f"- {fix}" for fix in fixes), ""]
+    polish = steps.get("polish", {})
+    if polish.get("skipped"):
+        lines += [f"Not made: {polish['skipped']}", ""]
+    elif polish.get("summary"):
+        lines += [str(polish["summary"]), ""]
+    return lines
+
+
 def render(store: RunStore) -> str:
     steps = store.steps
     directions = [item["name"] for item in steps.get("directions", {}).get("directions", [])]
@@ -79,6 +93,7 @@ def render(store: RunStore) -> str:
         lines += [f"## Champion: {champion['champion']}", "", str(champion.get("reason", "")), ""]
     if "result" in steps:
         lines += _result_section(steps["result"])
+    lines += _polish_section(steps)
 
     lines += _final_section(steps)
 
