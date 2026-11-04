@@ -58,6 +58,49 @@ battle undo                             # put the project back
 battle apply                            # apply a champion kept out with --no-apply
 ```
 
+## Team: build a whole website
+
+`/team` is a second command in this repo. Instead of one task fought over by equals, a team of agents takes a prompt through fixed stages, and the stages that matter most are fights:
+
+```text
+Your prompt
+  -> PM writes requirements.md: goals, pages, niche, constraints, acceptance criteria AC-1..n
+  -> Research writes research.md: niche, competitors, trends, two candidate stacks, facts, threats
+  -> Design fight: 2 designers with different skill kits, 1 judge, the winner makes the judge's fixes
+  -> Dev fight: 2 developers on different stacks, 1 judge who builds and runs both entries
+  -> Security: 6 attackers (auth, injection, xss, secrets, deps, access) probe the running site,
+     a verifier reproduces each finding, a fixer closes the confirmed ones, attackers re-test
+     ... until nothing confirmed is left, or the round limit (3) is reached
+  -> The winning, fixed code is applied. Documents stay in the run's docs/ folder
+```
+
+Every later stage sees only the winner of the stage before it. Judges score against the PM's acceptance criteria, after the engine runs mechanical checks: a scan for gradients (the UI rules forbid them), and the entry's own install, build and test commands from `.team/run.json`. Any agent can ask the research agent up to 3 questions and gets one more turn with the answers.
+
+Install it like battle, then type `/team a booking site for a boutique climbing gym` in a new Claude Code session:
+
+```bash
+bin/team install
+```
+
+From a terminal:
+
+```bash
+team plan --skip research --solo dev     # stages and agent runs, runs nothing
+team run "a landing page for a bakery"   # full run in the current folder
+team status / stop / resume / report / undo / apply
+```
+
+| Flag | Meaning |
+|---|---|
+| `--skip research`, `--skip design`, `--skip security` | Leave a stage out |
+| `--solo design`, `--solo dev` | One entrant instead of a fight |
+| `--angles auth,xss` | Only these attack angles |
+| `--security-rounds N` | Most attack, fix and re-test rounds |
+| `--agent host --agent codex` | Side A runs in the chat, side B on Codex |
+| `--no-apply`, `--keep`, `--no-web`, `--model`, `--at-once`, `--timeout` | As for battle |
+
+A full default run is up to 33 agent runs: 1 PM, 1 research, 4 per fight, and 8 per security round. Developers, judges, attackers and the fixer run shell commands so they can install, build, serve and probe the site. Those commands are **not sandboxed**: the guard only limits file tools to each agent's own folder. Run it on projects and machines where that is acceptable.
+
 ## Sizes
 
 | Size | Groups | Fighters | Agent runs | Steps one after another |

@@ -77,6 +77,8 @@ class Job:
     timeout: float = DEFAULT_TIMEOUT
     label: str = ""
     group: str = ""
+    subagent: str = ""
+    bash: bool = False
 
 
 class Agent(Protocol):
@@ -244,9 +246,10 @@ class ClaudeAgent(_ProcessAgent):
     name: str = "claude"
 
     def command(self, job: Job) -> list[str]:
-        shell = ("Bash",) if self.allow_bash else ()
+        shell = ("Bash",) if job.bash or (self.allow_bash and job.writes) else ()
         web = WEB_TOOLS if self.web else ()
-        tools = ",".join((*FIGHTER_TOOLS, *shell, *web) if job.writes else (*JUDGE_TOOLS, *web))
+        base = FIGHTER_TOOLS if job.writes else JUDGE_TOOLS
+        tools = ",".join((*base, *shell, *web))
         argv = [
             self.binary,
             "-p",
