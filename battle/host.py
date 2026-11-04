@@ -136,7 +136,7 @@ class HostAgent:
             "role": job.role,
             "label": job.label or job.role,
             "group": job.group,
-            "subagent_type": "battle-fighter" if job.writes else "battle-judge",
+            "subagent_type": job.subagent or ("battle-fighter" if job.writes else "battle-judge"),
             "model": subagent_model(self.model),
             "cwd": str(job.cwd),
             "prompt_file": str(prompt_file),

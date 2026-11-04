@@ -32,6 +32,7 @@ EXCLUDED_DIRS = frozenset(
         "target",
         ".gradle",
         ".battle",
+        ".team",
         RIVALS_DIR,
     }
 )
